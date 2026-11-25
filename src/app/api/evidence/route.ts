@@ -1,17 +1,16 @@
-import crypto from "node:crypto";
 import { NextResponse } from "next/server";
 import { appendAuditLog } from "@/lib/security/audit";
 import {
-  type CommitteeRecipientKey,
-  encryptEvidenceBuffer,
   isValidRsaPublicKeyPem,
   REQUIRED_UNLOCK_APPROVALS,
   safeEqualHex,
   sha256Hex,
+  validateEncryptedEvidenceBlob,
 } from "@/lib/security/crypto";
 import { checkRateLimit, getRateLimitClientKey } from "@/lib/security/rate-limit";
 import {
   ALLOWED_EVIDENCE_MIME_TYPES,
+  isUuid,
   isValidCaseIdFormat,
   MAX_EVIDENCE_BYTES,
   readNonEmptyString,
@@ -23,7 +22,10 @@ import {
 } from "@/lib/supabase/config";
 import { EVIDENCE_BUCKET_NAME } from "@/lib/supabase/health";
 
-/** Follow-up encrypted evidence upload authorized by Case ID + Recovery Secret. */
+/**
+ * Follow-up browser-encrypted AWZ1 evidence upload authorized by Case ID + Recovery Secret.
+ * Never receives or encrypts raw unencrypted evidence bytes on the server.
+ */
 export async function POST(request: Request) {
   const rate = checkRateLimit(
     getRateLimitClientKey(request.headers, "upload-evidence"),
@@ -60,6 +62,8 @@ export async function POST(request: Request) {
     6,
     64
   );
+  const rawFileId = formData.get("fileId");
+  const rawMimeType = formData.get("mimeType");
   const file = formData.get("file");
 
   if (!isValidCaseIdFormat(rawCaseCode) || !rawRecoverySecret) {
@@ -69,25 +73,27 @@ export async function POST(request: Request) {
     );
   }
 
+  if (
+    !isUuid(rawFileId) ||
+    typeof rawMimeType !== "string" ||
+    !ALLOWED_EVIDENCE_MIME_TYPES.has(rawMimeType)
+  ) {
+    return NextResponse.json(
+      { error: "Valid fileId UUID and allowed mimeType are required." },
+      { status: 400 }
+    );
+  }
+
   if (!(file instanceof File) || file.size === 0) {
     return NextResponse.json(
-      { error: "Please attach a non-empty evidence file." },
+      { error: "Please attach a non-empty encrypted evidence blob." },
       { status: 400 }
     );
   }
 
-  if (file.size > MAX_EVIDENCE_BYTES) {
+  if (file.size > MAX_EVIDENCE_BYTES + 65536) {
     return NextResponse.json(
-      { error: "Evidence file exceeds the 5 MB limit." },
-      { status: 400 }
-    );
-  }
-
-  if (!ALLOWED_EVIDENCE_MIME_TYPES.has(file.type)) {
-    return NextResponse.json(
-      {
-        error: `Unsupported file type (${file.type || "unknown"}). Allowed: PNG, JPEG, WEBP, PDF, TXT.`,
-      },
+      { error: "Encrypted evidence blob exceeds the 5 MB limit." },
       { status: 400 }
     );
   }
@@ -122,16 +128,18 @@ export async function POST(request: Request) {
     .eq("is_active", true)
     .not("public_key", "is", null);
 
-  const recipients: CommitteeRecipientKey[] = (committeeRows ?? [])
-    .filter(
-      (row): row is { user_id: string; public_key: string } =>
-        typeof row.user_id === "string" &&
-        typeof row.public_key === "string" &&
-        isValidRsaPublicKeyPem(row.public_key)
-    )
-    .map((row) => ({ memberId: row.user_id, publicKeyPem: row.public_key }));
+  const activeMemberIds = new Set(
+    (committeeRows ?? [])
+      .filter(
+        (row): row is { user_id: string; public_key: string } =>
+          typeof row.user_id === "string" &&
+          typeof row.public_key === "string" &&
+          isValidRsaPublicKeyPem(row.public_key)
+      )
+      .map((row) => row.user_id)
+  );
 
-  if (recipients.length < REQUIRED_UNLOCK_APPROVALS) {
+  if (activeMemberIds.size < REQUIRED_UNLOCK_APPROVALS) {
     return NextResponse.json(
       {
         error: `Encrypted evidence requires at least ${REQUIRED_UNLOCK_APPROVALS} committee members with public keys.`,
@@ -140,20 +148,25 @@ export async function POST(request: Request) {
     );
   }
 
-  const fileId = crypto.randomUUID();
-  const rawBuffer = Buffer.from(await file.arrayBuffer());
-  const { encryptedBlob, ciphertextHash } = encryptEvidenceBuffer(
-    rawBuffer,
+  const fileId = (rawFileId as string).trim();
+  const encryptedBytes = Buffer.from(await file.arrayBuffer());
+  const blobCheck = validateEncryptedEvidenceBlob(
+    encryptedBytes,
     complaint.id,
     fileId,
-    recipients
+    activeMemberIds
   );
+
+  if (!blobCheck.ok) {
+    return NextResponse.json({ error: blobCheck.error }, { status: 400 });
+  }
+
   const storagePath = `complaints/${complaint.id}/${fileId}.enc`;
   const nowIso = new Date().toISOString();
 
   const { error: uploadError } = await admin.storage
     .from(EVIDENCE_BUCKET_NAME)
-    .upload(storagePath, encryptedBlob, {
+    .upload(storagePath, encryptedBytes, {
       contentType: "application/octet-stream",
       upsert: false,
     });
@@ -169,9 +182,9 @@ export async function POST(request: Request) {
     id: fileId,
     complaint_id: complaint.id,
     storage_path: storagePath,
-    mime_type: file.type,
-    file_size: encryptedBlob.length,
-    file_hash: ciphertextHash,
+    mime_type: rawMimeType,
+    file_size: encryptedBytes.length,
+    file_hash: blobCheck.ciphertextHash,
     created_at: nowIso,
   });
 
@@ -188,8 +201,9 @@ export async function POST(request: Request) {
     eventType: "EVIDENCE_UPLOADED",
     eventDetails: {
       evidenceFileId: fileId,
-      mimeType: file.type,
-      encryptedSize: encryptedBlob.length,
+      mimeType: rawMimeType,
+      encryptedSize: encryptedBytes.length,
+      clientEncrypted: true,
     },
   });
 
@@ -197,7 +211,7 @@ export async function POST(request: Request) {
     {
       evidenceId: fileId,
       complaintId: complaint.id,
-      fileHash: ciphertextHash,
+      fileHash: blobCheck.ciphertextHash,
     },
     { status: 201 }
   );

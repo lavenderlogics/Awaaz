@@ -89,6 +89,7 @@ export async function POST(request: Request) {
 
   return NextResponse.json({
     found: true,
+    complaintId: recoveryVerified === true ? complaint.id : undefined,
     caseCode: normalizedCaseCode,
     category: complaint.category,
     status: complaint.status ?? "submitted",

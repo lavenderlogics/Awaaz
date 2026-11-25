@@ -8,8 +8,17 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { FormField, Input } from "@/components/ui/FormField";
 import { StatusNotice } from "@/components/ui/StatusNotice";
 import { PLANNED_CASE_STAGES } from "@/lib/constants";
+import {
+  encryptEvidenceBytesInBrowser,
+  type PublicCommitteeRecipient,
+} from "@/lib/security/client-crypto";
+import {
+  ALLOWED_EVIDENCE_MIME_TYPES,
+  MAX_EVIDENCE_BYTES,
+} from "@/lib/security/validation";
 
 interface TrackResult {
+  complaintId: string | null;
   caseCode: string;
   category: string;
   status: string;
@@ -21,7 +30,7 @@ interface TrackResult {
   recoveryVerified: boolean | null;
 }
 
-/** Live anonymous Case ID lookup and authorized follow-up evidence uploader. */
+/** Live anonymous Case ID lookup and client-encrypted follow-up evidence uploader. */
 export function TrackCaseClient() {
   const [caseId, setCaseId] = useState("");
   const [recoverySecret, setRecoverySecret] = useState("");
@@ -71,6 +80,8 @@ export function TrackCaseClient() {
       }
 
       setResult({
+        complaintId:
+          typeof json.complaintId === "string" ? json.complaintId : null,
         caseCode: String(json.caseCode ?? trimmed),
         category: String(json.category ?? "General"),
         status: String(json.status ?? "submitted"),
@@ -98,17 +109,75 @@ export function TrackCaseClient() {
 
   const handleEvidenceUpload = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!result || !evidenceFile || !recoverySecret.trim()) return;
+    if (
+      !result ||
+      !result.complaintId ||
+      !evidenceFile ||
+      !recoverySecret.trim()
+    ) {
+      return;
+    }
+
+    if (evidenceFile.size > MAX_EVIDENCE_BYTES) {
+      setUploadError("Evidence file exceeds the 5 MB limit.");
+      return;
+    }
+
+    if (!ALLOWED_EVIDENCE_MIME_TYPES.has(evidenceFile.type)) {
+      setUploadError(
+        `Unsupported file type (${evidenceFile.type || "unknown"}). Allowed: PNG, JPEG, WEBP, PDF, TXT.`
+      );
+      return;
+    }
 
     setIsUploading(true);
     setUploadError("");
     setUploadStatus("");
 
     try {
+      const keysRes = await fetch("/api/committee/public-keys", {
+        cache: "no-store",
+      });
+      const keysJson = (await keysRes.json()) as {
+        members?: PublicCommitteeRecipient[];
+        error?: string;
+      };
+
+      if (
+        !keysRes.ok ||
+        !Array.isArray(keysJson.members) ||
+        keysJson.members.length < 2
+      ) {
+        setUploadError(
+          keysJson.error ??
+            "Unable to load committee public keys. Evidence was not uploaded."
+        );
+        return;
+      }
+
+      const fileId = window.crypto.randomUUID();
+      const rawBytes = new Uint8Array(await evidenceFile.arrayBuffer());
+      const encryptedResult = await encryptEvidenceBytesInBrowser({
+        fileBytes: rawBytes,
+        mimeType: evidenceFile.type,
+        complaintId: result.complaintId,
+        fileId,
+        recipients: keysJson.members,
+      });
+      rawBytes.fill(0);
+
+      const copy = new Uint8Array(encryptedResult.encryptedBytes.byteLength);
+      copy.set(encryptedResult.encryptedBytes);
+      const encryptedBlob = new Blob([copy.buffer], {
+        type: "application/octet-stream",
+      });
+
       const formData = new FormData();
       formData.set("caseCode", result.caseCode);
       formData.set("recoverySecret", recoverySecret.trim());
-      formData.set("file", evidenceFile);
+      formData.set("fileId", fileId);
+      formData.set("mimeType", encryptedResult.mimeType);
+      formData.set("file", encryptedBlob, `${fileId}.enc`);
 
       const res = await fetch("/api/evidence", {
         method: "POST",
@@ -126,12 +195,16 @@ export function TrackCaseClient() {
       }
 
       setEvidenceFile(null);
-      setUploadStatus("Encrypted evidence uploaded to awaaz-evidence.");
+      setUploadStatus(
+        "Browser-encrypted evidence uploaded to awaaz-evidence."
+      );
       setResult((prev) =>
         prev ? { ...prev, evidenceCount: prev.evidenceCount + 1 } : prev
       );
     } catch {
-      setUploadError("Network error while uploading evidence.");
+      setUploadError(
+        "Browser encryption failed. Raw evidence was not transmitted."
+      );
     } finally {
       setIsUploading(false);
     }
@@ -148,7 +221,7 @@ export function TrackCaseClient() {
           <CardTitle>Look Up Complaint Status</CardTitle>
           <p className="mt-1 text-sm text-slate-600">
             Enter your Case ID (and optionally your Recovery Secret to attach
-            additional encrypted evidence).
+            additional browser-encrypted evidence).
           </p>
         </CardHeader>
         <CardContent className="pt-6">
@@ -273,7 +346,9 @@ export function TrackCaseClient() {
                       size="sm"
                       disabled={!evidenceFile || isUploading}
                     >
-                      {isUploading ? "Encrypting..." : "Upload Encrypted File"}
+                      {isUploading
+                        ? "Encrypting in Browser..."
+                        : "Upload Encrypted File"}
                     </Button>
                   </div>
                   {uploadError ? (

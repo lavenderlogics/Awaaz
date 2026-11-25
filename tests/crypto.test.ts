@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test from "node:test";
 import {
+  encryptComplaintInBrowser,
+  encryptEvidenceBytesInBrowser,
+} from "../src/lib/security/client-crypto.ts";
+import {
   combineShares2OfN,
   decryptComplaintEnvelope,
   encryptComplaintPayload,
@@ -11,7 +15,15 @@ import {
   splitSecret2OfN,
   unprotectStoredShare,
   unwrapMemberShareWithPrivateKey,
+  validateEncryptedComplaintEnvelope,
+  validateEncryptedEvidenceBlob,
 } from "../src/lib/security/crypto.ts";
+import {
+  combineShares2OfNBytes,
+  decodeShamirShare,
+  encodeShamirShare,
+  splitSecret2OfNBytes,
+} from "../src/lib/security/shamir.ts";
 
 function makeMember(id: string) {
   const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", {
@@ -21,6 +33,20 @@ function makeMember(id: string) {
   });
   return { id, publicKey, privateKey };
 }
+
+test("Browser Uint8Array Shamir 2-of-3 reconstructs exact 32-byte key from any pair", () => {
+  const dek = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(dek);
+  const shares = splitSecret2OfNBytes(dek, 3);
+  assert.equal(shares.length, 3);
+
+  const encoded = shares.map((s) => decodeShamirShare(encodeShamirShare(s)));
+  assert.deepEqual(combineShares2OfNBytes([encoded[0], encoded[1]]), dek);
+  assert.deepEqual(combineShares2OfNBytes([encoded[0], encoded[2]]), dek);
+  assert.deepEqual(combineShares2OfNBytes([encoded[1], encoded[2]]), dek);
+  assert.throws(() => combineShares2OfNBytes([encoded[0]]));
+  assert.throws(() => combineShares2OfNBytes([encoded[0], encoded[0]]));
+});
 
 test("Shamir 2-of-3 secret sharing reconstructs exact 32-byte DEK from any pair", () => {
   const dek = crypto.randomBytes(32);
@@ -33,6 +59,124 @@ test("Shamir 2-of-3 secret sharing reconstructs exact 32-byte DEK from any pair"
 
   assert.throws(() => combineShares2OfN([shares[0]]));
   assert.throws(() => combineShares2OfN([shares[0], shares[0]]));
+});
+
+test("Browser WebCrypto complaint encryption validates and decrypts cleanly with server unlock", async () => {
+  const m1 = makeMember("11111111-1111-1111-1111-111111111111");
+  const m2 = makeMember("22222222-2222-2222-2222-222222222222");
+  const m3 = makeMember("33333333-3333-3333-3333-333333333333");
+  const complaintId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const secret = "test-server-wrapping-secret";
+
+  const payload = {
+    detailedCategory: "Ragging / Hazing",
+    urgency: "elevated",
+    incidentDate: "2026-11-25",
+    location: "North Hostel Corridor",
+    description: "Browser-encrypted complaint narrative that server must never read.",
+    additionalContext: "Witnesses present",
+    evidenceFileNames: ["photo.png", "report.pdf"],
+  };
+
+  const envelope = await encryptComplaintInBrowser({
+    complaintId,
+    payload,
+    recipients: [
+      { memberId: m1.id, publicKey: m1.publicKey },
+      { memberId: m2.id, publicKey: m2.publicKey },
+      { memberId: m3.id, publicKey: m3.publicKey },
+    ],
+  });
+
+  const serialized = JSON.stringify(envelope);
+  assert.equal(serialized.includes("North Hostel Corridor"), false);
+  assert.equal(serialized.includes("Browser-encrypted complaint"), false);
+
+  const activeIds = new Set([m1.id, m2.id, m3.id]);
+  const validation = validateEncryptedComplaintEnvelope(envelope, activeIds);
+  assert.equal(validation.ok, true);
+
+  const s1 = unwrapMemberShareWithPrivateKey(envelope.shares[m1.id], m1.privateKey);
+  const s2 = unwrapMemberShareWithPrivateKey(envelope.shares[m2.id], m2.privateKey);
+  const wrapped1 = protectStoredShare(s1, complaintId, m1.id, secret);
+  const wrapped2 = protectStoredShare(s2, complaintId, m2.id, secret);
+
+  const decrypted = decryptComplaintEnvelope<typeof payload>(
+    envelope,
+    complaintId,
+    [
+      unprotectStoredShare(wrapped1, complaintId, m1.id, secret),
+      unprotectStoredShare(wrapped2, complaintId, m2.id, secret),
+    ]
+  );
+  assert.deepEqual(decrypted, payload);
+
+  // Wrong AAD must reject decryption
+  assert.throws(() =>
+    decryptComplaintEnvelope(envelope, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", [
+      s1,
+      s2,
+    ])
+  );
+});
+
+test("Browser WebCrypto evidence encryption produces valid AWZ1 blobs with unique IVs", async () => {
+  const m1 = makeMember("11111111-1111-1111-1111-111111111111");
+  const m2 = makeMember("22222222-2222-2222-2222-222222222222");
+  const complaintId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const imgId = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+  const pdfId = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+
+  const imgRaw = new TextEncoder().encode("PNG_BINARY_TEST_CONTENT");
+  const pdfRaw = new TextEncoder().encode("%PDF-1.7 TEST CONTENT");
+
+  const imgEnc = await encryptEvidenceBytesInBrowser({
+    fileBytes: imgRaw,
+    mimeType: "image/png",
+    complaintId,
+    fileId: imgId,
+    recipients: [
+      { memberId: m1.id, publicKey: m1.publicKey },
+      { memberId: m2.id, publicKey: m2.publicKey },
+    ],
+  });
+  const pdfEnc = await encryptEvidenceBytesInBrowser({
+    fileBytes: pdfRaw,
+    mimeType: "application/pdf",
+    complaintId,
+    fileId: pdfId,
+    recipients: [
+      { memberId: m1.id, publicKey: m1.publicKey },
+      { memberId: m2.id, publicKey: m2.publicKey },
+    ],
+  });
+
+  const imgBuf = Buffer.from(imgEnc.encryptedBytes);
+  const pdfBuf = Buffer.from(pdfEnc.encryptedBytes);
+
+  assert.equal(imgBuf.includes(Buffer.from(imgRaw)), false);
+  assert.equal(pdfBuf.includes(Buffer.from(pdfRaw)), false);
+
+  const activeIds = new Set([m1.id, m2.id]);
+  const imgValid = validateEncryptedEvidenceBlob(imgBuf, complaintId, imgId, activeIds);
+  const pdfValid = validateEncryptedEvidenceBlob(pdfBuf, complaintId, pdfId, activeIds);
+  assert.equal(imgValid.ok, true);
+  assert.equal(pdfValid.ok, true);
+
+  const imgHeader = JSON.parse(imgBuf.subarray(8, 8 + imgBuf.readUInt32BE(4)).toString("utf8"));
+  const pdfHeader = JSON.parse(pdfBuf.subarray(8, 8 + pdfBuf.readUInt32BE(4)).toString("utf8"));
+  assert.notEqual(imgHeader.iv, pdfHeader.iv);
+});
+
+test("Browser encryption rejects insufficient committee keys without producing output", async () => {
+  const m1 = makeMember("11111111-1111-1111-1111-111111111111");
+  await assert.rejects(() =>
+    encryptComplaintInBrowser({
+      complaintId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      payload: { description: "Should fail before transmission" },
+      recipients: [{ memberId: m1.id, publicKey: m1.publicKey }],
+    })
+  );
 });
 
 test("AES-256-GCM + RSA-OAEP 2-of-N envelope round-trip and tamper rejection", () => {
@@ -55,12 +199,10 @@ test("AES-256-GCM + RSA-OAEP 2-of-N envelope round-trip and tamper rejection", (
     { memberId: m3.id, publicKeyPem: m3.publicKey },
   ]);
 
-  // Ensure plaintext does not appear anywhere in the encrypted envelope
   const serialized = JSON.stringify(envelope);
   assert.equal(serialized.includes("Hostel Block B"), false);
   assert.equal(serialized.includes("Sensitive incident narrative"), false);
 
-  // Member 1 and Member 3 unwrap their shares with private keys and protect in unlock_approvals
   const s1 = unwrapMemberShareWithPrivateKey(envelope.shares[m1.id], m1.privateKey);
   const s3 = unwrapMemberShareWithPrivateKey(envelope.shares[m3.id], m3.privateKey);
 
@@ -77,7 +219,6 @@ test("AES-256-GCM + RSA-OAEP 2-of-N envelope round-trip and tamper rejection", (
   );
   assert.deepEqual(decrypted, payload);
 
-  // Wrong AAD (different complaintId) must fail GCM authentication
   assert.throws(() =>
     decryptComplaintEnvelope(envelope, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", [
       unwrapped1,
@@ -85,7 +226,6 @@ test("AES-256-GCM + RSA-OAEP 2-of-N envelope round-trip and tamper rejection", (
     ])
   );
 
-  // Tampered ciphertext must fail GCM authentication
   const tampered = { ...envelope, ciphertext: Buffer.from("tampered").toString("base64") };
   assert.throws(() =>
     decryptComplaintEnvelope(tampered, complaintId, [unwrapped1, unwrapped3])

@@ -1,4 +1,10 @@
 import crypto from "node:crypto";
+import {
+  combineShares2OfNBytes,
+  decodeShamirShare,
+  encodeShamirShare,
+  splitSecret2OfNBytes,
+} from "./shamir.ts";
 
 export const ENCRYPTION_ALGORITHM = "AES-256-GCM";
 export const REQUIRED_UNLOCK_APPROVALS = 2;
@@ -30,46 +36,6 @@ export interface EncryptedFileHeader {
 
 const FILE_MAGIC = Buffer.from("AWZ1", "ascii");
 
-// GF(256) arithmetic with AES irreducible polynomial x^8 + x^4 + x^3 + x + 1 (0x11b)
-function gfMul(a: number, b: number): number {
-  let res = 0;
-  let aa = a;
-  let bb = b;
-  for (let i = 0; i < 8; i++) {
-    if ((bb & 1) !== 0) {
-      res ^= aa;
-    }
-    const carry = aa & 0x80;
-    aa = (aa << 1) & 0xff;
-    if (carry !== 0) {
-      aa ^= 0x1b;
-    }
-    bb >>= 1;
-  }
-  return res;
-}
-
-function gfPow(base: number, exp: number): number {
-  let result = 1;
-  let b = base;
-  let e = exp;
-  while (e > 0) {
-    if ((e & 1) !== 0) {
-      result = gfMul(result, b);
-    }
-    b = gfMul(b, b);
-    e >>= 1;
-  }
-  return result;
-}
-
-function gfInv(a: number): number {
-  if (a === 0) {
-    throw new Error("Cannot invert zero in GF(256).");
-  }
-  return gfPow(a, 254);
-}
-
 /**
  * Splits a secret buffer into N shares where any 2 distinct shares reconstruct
  * the secret and any single share reveals zero information.
@@ -78,62 +44,17 @@ export function splitSecret2OfN(
   secret: Buffer,
   shareCount: number
 ): Array<{ x: number; y: Buffer }> {
-  if (shareCount < 2 || shareCount > 250) {
-    throw new Error("Shamir 2-of-N requires between 2 and 250 recipients.");
-  }
-
-  const slope = crypto.randomBytes(secret.length);
-  const shares: Array<{ x: number; y: Buffer }> = [];
-
-  for (let i = 1; i <= shareCount; i++) {
-    const y = Buffer.alloc(secret.length);
-    for (let byteIdx = 0; byteIdx < secret.length; byteIdx++) {
-      y[byteIdx] = secret[byteIdx] ^ gfMul(slope[byteIdx], i);
-    }
-    shares.push({ x: i, y });
-  }
-
-  return shares;
+  return splitSecret2OfNBytes(secret, shareCount).map((share) => ({
+    x: share.x,
+    y: Buffer.from(share.y),
+  }));
 }
 
 /** Reconstructs the secret from at least 2 distinct Shamir shares over GF(256). */
 export function combineShares2OfN(
   shares: Array<{ x: number; y: Buffer }>
 ): Buffer {
-  if (shares.length < 2) {
-    throw new Error("At least 2 distinct shares are required to reconstruct DEK.");
-  }
-
-  const [s1, s2] = shares;
-  if (s1.x === s2.x) {
-    throw new Error("Shares must belong to distinct participants.");
-  }
-  if (s1.y.length !== s2.y.length) {
-    throw new Error("Share lengths do not match.");
-  }
-
-  // Evaluate f(0) via Lagrange interpolation over GF(256)
-  // f(0) = y1 * (x2 / (x1 ^ x2)) ^ y2 * (x1 / (x1 ^ x2))
-  const denomInv = gfInv(s1.x ^ s2.x);
-  const l1 = gfMul(s2.x, denomInv);
-  const l2 = gfMul(s1.x, denomInv);
-
-  const secret = Buffer.alloc(s1.y.length);
-  for (let i = 0; i < secret.length; i++) {
-    secret[i] = gfMul(s1.y[i], l1) ^ gfMul(s2.y[i], l2);
-  }
-  return secret;
-}
-
-function encodeShare(share: { x: number; y: Buffer }): Buffer {
-  return Buffer.concat([Buffer.from([share.x]), share.y]);
-}
-
-function decodeShare(buf: Buffer): { x: number; y: Buffer } {
-  if (buf.length !== 33) {
-    throw new Error("Invalid key share length.");
-  }
-  return { x: buf[0], y: buf.subarray(1) };
+  return Buffer.from(combineShares2OfNBytes(shares));
 }
 
 function wrapDekForRecipients(
@@ -150,7 +71,7 @@ function wrapDekForRecipients(
   const wrapped: Record<string, string> = {};
 
   recipients.forEach((recipient, index) => {
-    const sharePayload = encodeShare(rawShares[index]);
+    const sharePayload = Buffer.from(encodeShamirShare(rawShares[index]));
     const encryptedShare = crypto.publicEncrypt(
       {
         key: recipient.publicKeyPem,
@@ -165,7 +86,7 @@ function wrapDekForRecipients(
   return wrapped;
 }
 
-/** Encrypts a JSON-serializable complaint payload using AES-256-GCM + 2-of-N RSA-OAEP. */
+/** Server-side helper retained for unit/regression test compatibility. */
 export function encryptComplaintPayload(
   payload: unknown,
   complaintId: string,
@@ -192,6 +113,181 @@ export function encryptComplaintPayload(
     ciphertext: ciphertext.toString("base64"),
     shares,
   };
+}
+
+function isStrictBase64WithByteLength(
+  value: unknown,
+  expectedLength: number | null
+): boolean {
+  if (typeof value !== "string" || value.length === 0) {
+    return false;
+  }
+  const normalized = value.replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/]+=*$/.test(normalized)) {
+    return false;
+  }
+  const decoded = Buffer.from(normalized, "base64");
+  if (decoded.length === 0) {
+    return false;
+  }
+  if (expectedLength !== null && decoded.length !== expectedLength) {
+    return false;
+  }
+  return true;
+}
+
+/** Validates a client-encrypted complaint envelope before storing it in `complaints`. */
+export function validateEncryptedComplaintEnvelope(
+  candidate: unknown,
+  activeMemberIds: Set<string>
+): { ok: true; envelope: EncryptedComplaintEnvelope } | { ok: false; error: string } {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return { ok: false, error: "Encrypted payload must be an object." };
+  }
+
+  const env = candidate as Record<string, unknown>;
+  if (env.version !== 1) {
+    return { ok: false, error: "Unsupported encrypted envelope version." };
+  }
+  if (env.algorithm !== "AES-256-GCM") {
+    return { ok: false, error: "Encrypted envelope must use AES-256-GCM." };
+  }
+  if (env.keyScheme !== "SSS-2-OF-N+RSA-OAEP-256") {
+    return {
+      ok: false,
+      error: "Encrypted envelope must use SSS-2-OF-N+RSA-OAEP-256.",
+    };
+  }
+  if (!isStrictBase64WithByteLength(env.iv, 12)) {
+    return { ok: false, error: "AES-GCM IV must be 12 random bytes (base64)." };
+  }
+  if (!isStrictBase64WithByteLength(env.authTag, 16)) {
+    return {
+      ok: false,
+      error: "AES-GCM authTag must be 16 bytes (base64).",
+    };
+  }
+  if (!isStrictBase64WithByteLength(env.ciphertext, null)) {
+    return { ok: false, error: "Encrypted ciphertext must be non-empty base64." };
+  }
+
+  if (!env.shares || typeof env.shares !== "object" || Array.isArray(env.shares)) {
+    return { ok: false, error: "Encrypted Shamir key shares are required." };
+  }
+
+  const sharesObj = env.shares as Record<string, unknown>;
+  let validMemberShares = 0;
+  const sanitizedShares: Record<string, string> = {};
+
+  for (const [memberId, wrappedShare] of Object.entries(sharesObj)) {
+    if (!activeMemberIds.has(memberId)) {
+      continue;
+    }
+    if (!isStrictBase64WithByteLength(wrappedShare, 256)) {
+      return {
+        ok: false,
+        error: `Wrapped RSA-OAEP share for member ${memberId} is invalid.`,
+      };
+    }
+    sanitizedShares[memberId] = wrappedShare as string;
+    validMemberShares += 1;
+  }
+
+  if (validMemberShares < REQUIRED_UNLOCK_APPROVALS) {
+    return {
+      ok: false,
+      error: `At least ${REQUIRED_UNLOCK_APPROVALS} valid committee key shares are required.`,
+    };
+  }
+
+  return {
+    ok: true,
+    envelope: {
+      version: 1,
+      algorithm: "AES-256-GCM",
+      keyScheme: "SSS-2-OF-N+RSA-OAEP-256",
+      iv: env.iv as string,
+      authTag: env.authTag as string,
+      ciphertext: env.ciphertext as string,
+      shares: sanitizedShares,
+    },
+  };
+}
+
+/** Validates a client-encrypted `AWZ1` evidence blob without seeing raw bytes. */
+export function validateEncryptedEvidenceBlob(
+  blob: Buffer,
+  expectedComplaintId: string,
+  expectedFileId: string,
+  activeMemberIds: Set<string>
+): { ok: true; ciphertextHash: string } | { ok: false; error: string } {
+  if (blob.length < 16) {
+    return { ok: false, error: "Encrypted evidence blob is too short." };
+  }
+  if (!blob.subarray(0, 4).equals(FILE_MAGIC)) {
+    return { ok: false, error: "Evidence blob missing AWZ1 encrypted header." };
+  }
+
+  const headerLen = blob.readUInt32BE(4);
+  if (headerLen < 20 || headerLen > 65536 || 8 + headerLen >= blob.length) {
+    return { ok: false, error: "Encrypted evidence header length is invalid." };
+  }
+
+  let header: Record<string, unknown>;
+  try {
+    header = JSON.parse(
+      blob.subarray(8, 8 + headerLen).toString("utf8")
+    ) as Record<string, unknown>;
+  } catch {
+    return { ok: false, error: "Encrypted evidence header is malformed JSON." };
+  }
+
+  if (
+    header.version !== 1 ||
+    header.algorithm !== "AES-256-GCM" ||
+    header.complaintId !== expectedComplaintId ||
+    header.fileId !== expectedFileId
+  ) {
+    return {
+      ok: false,
+      error: "Encrypted evidence header metadata mismatch.",
+    };
+  }
+  if (
+    !isStrictBase64WithByteLength(header.iv, 12) ||
+    !isStrictBase64WithByteLength(header.authTag, 16)
+  ) {
+    return { ok: false, error: "Encrypted evidence IV or authTag is invalid." };
+  }
+
+  if (
+    !header.shares ||
+    typeof header.shares !== "object" ||
+    Array.isArray(header.shares)
+  ) {
+    return { ok: false, error: "Encrypted evidence shares are missing." };
+  }
+
+  let validShares = 0;
+  for (const [memberId, shareVal] of Object.entries(
+    header.shares as Record<string, unknown>
+  )) {
+    if (
+      activeMemberIds.has(memberId) &&
+      isStrictBase64WithByteLength(shareVal, 256)
+    ) {
+      validShares += 1;
+    }
+  }
+
+  if (validShares < REQUIRED_UNLOCK_APPROVALS) {
+    return {
+      ok: false,
+      error: `Encrypted evidence requires at least ${REQUIRED_UNLOCK_APPROVALS} committee shares.`,
+    };
+  }
+
+  return { ok: true, ciphertextHash: sha256Hex(blob) };
 }
 
 /** Uses a committee member's RSA private key to unwrap their share from an envelope. */
@@ -286,7 +382,10 @@ export function decryptComplaintEnvelope<T = Record<string, unknown>>(
   complaintId: string,
   rawShareBuffers: Buffer[]
 ): T {
-  const shares = rawShareBuffers.map(decodeShare);
+  const shares = rawShareBuffers.map((buf) => {
+    const decoded = decodeShamirShare(buf);
+    return { x: decoded.x, y: Buffer.from(decoded.y) };
+  });
   const dek = combineShares2OfN(shares);
 
   try {
@@ -309,7 +408,7 @@ export function decryptComplaintEnvelope<T = Record<string, unknown>>(
   }
 }
 
-/** Encrypts an evidence file buffer into a self-describing AES-256-GCM envelope. */
+/** Server-side evidence helper retained for unit/regression test compatibility. */
 export function encryptEvidenceBuffer(
   fileBytes: Buffer,
   complaintId: string,
@@ -394,10 +493,15 @@ export function generateTrackingCredentials(): {
   };
 }
 
+/** Validates that a PEM string is an RSA public key suitable for RSA-OAEP (>= 2048 bits). */
 export function isValidRsaPublicKeyPem(pem: string): boolean {
   try {
     const keyObj = crypto.createPublicKey(pem);
-    return keyObj.asymmetricKeyType === "rsa";
+    if (keyObj.asymmetricKeyType !== "rsa") {
+      return false;
+    }
+    const modulusLength = keyObj.asymmetricKeyDetails?.modulusLength ?? 0;
+    return modulusLength >= 2048;
   } catch {
     return false;
   }

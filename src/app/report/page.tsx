@@ -24,13 +24,14 @@ export default function ReportPage() {
       <section className="mx-auto max-w-6xl px-4 py-10 sm:px-6 sm:py-14 lg:px-8">
         <div className="mb-8">
           <StatusNotice
-            title="Zero Plaintext Storage &amp; Dual-Key Protection"
+            title="Zero Plaintext Storage &amp; Browser-Side Encryption"
             variant="info"
           >
             Sensitive complaint details and attached evidence files are
-            encrypted with <strong>AES-256-GCM</strong> before storage, and
-            decryption keys are split across authorized committee members so no
-            single account can read reports alone.
+            encrypted inside your browser with <strong>AES-256-GCM</strong>{" "}
+            before transmission, and decryption keys are split across
+            authorized committee members so no single account can read reports
+            alone.
           </StatusNotice>
         </div>
 

@@ -1,25 +1,21 @@
-import crypto from "node:crypto";
 import { NextResponse } from "next/server";
 import { mapUiCategoryToDbCategory } from "@/lib/constants";
 import { appendAuditLog } from "@/lib/security/audit";
 import {
-  type CommitteeRecipientKey,
   ENCRYPTION_ALGORITHM,
-  encryptComplaintPayload,
-  encryptEvidenceBuffer,
   generateTrackingCredentials,
   isValidRsaPublicKeyPem,
   REQUIRED_UNLOCK_APPROVALS,
+  validateEncryptedComplaintEnvelope,
+  validateEncryptedEvidenceBlob,
 } from "@/lib/security/crypto";
 import { checkRateLimit, getRateLimitClientKey } from "@/lib/security/rate-limit";
 import {
   ALLOWED_EVIDENCE_MIME_TYPES,
-  isIsoDateString,
+  isUuid,
   isValidCategory,
-  isValidUrgency,
   MAX_EVIDENCE_BYTES,
   MAX_EVIDENCE_FILES,
-  readNonEmptyString,
 } from "@/lib/security/validation";
 import { createAdminClient } from "@/lib/supabase/admin";
 import {
@@ -28,47 +24,94 @@ import {
 } from "@/lib/supabase/config";
 import { EVIDENCE_BUCKET_NAME } from "@/lib/supabase/health";
 
-interface ParsedSubmission {
-  category: unknown;
-  urgency: unknown;
-  incidentDate: unknown;
-  location: unknown;
-  description: unknown;
-  additionalContext: unknown;
-  files: File[];
+const FORBIDDEN_PLAINTEXT_FIELDS = [
+  "description",
+  "location",
+  "additionalContext",
+  "incidentDate",
+  "urgency",
+  "aesKey",
+  "rawKey",
+  "privateKey",
+] as const;
+
+interface EvidenceMetadataInput {
+  fileId: string;
+  mimeType: string;
 }
 
-async function parseRequestBody(request: Request): Promise<ParsedSubmission> {
+interface ParsedEncryptedSubmission {
+  complaintId: unknown;
+  category: unknown;
+  encryptedPayload: unknown;
+  evidenceBlobs: File[];
+  evidenceMeta: unknown;
+  forbiddenFieldsPresent: string[];
+}
+
+async function parseSubmission(
+  request: Request
+): Promise<ParsedEncryptedSubmission> {
   const contentType = request.headers.get("content-type") ?? "";
   if (contentType.includes("multipart/form-data")) {
     const formData = await request.formData();
-    const rawFiles = formData
+    const forbiddenFieldsPresent = FORBIDDEN_PLAINTEXT_FIELDS.filter((field) =>
+      formData.has(field)
+    );
+    const rawPayload = formData.get("encryptedPayload");
+    const rawMeta = formData.get("evidenceMeta");
+    const evidenceBlobs = formData
       .getAll("evidence")
       .filter((entry): entry is File => entry instanceof File && entry.size > 0);
+
+    let parsedPayload: unknown = rawPayload;
+    if (typeof rawPayload === "string") {
+      try {
+        parsedPayload = JSON.parse(rawPayload);
+      } catch {
+        parsedPayload = null;
+      }
+    }
+
+    let parsedMeta: unknown = [];
+    if (typeof rawMeta === "string" && rawMeta.trim()) {
+      try {
+        parsedMeta = JSON.parse(rawMeta);
+      } catch {
+        parsedMeta = null;
+      }
+    }
+
     return {
+      complaintId: formData.get("complaintId"),
       category: formData.get("category"),
-      urgency: formData.get("urgency"),
-      incidentDate: formData.get("incidentDate"),
-      location: formData.get("location"),
-      description: formData.get("description"),
-      additionalContext: formData.get("additionalContext"),
-      files: rawFiles,
+      encryptedPayload: parsedPayload,
+      evidenceBlobs,
+      evidenceMeta: parsedMeta,
+      forbiddenFieldsPresent,
     };
   }
 
   const body = (await request.json()) as Record<string, unknown>;
+  const forbiddenFieldsPresent = FORBIDDEN_PLAINTEXT_FIELDS.filter(
+    (field) => body[field] !== undefined
+  );
+
   return {
+    complaintId: body.complaintId,
     category: body.category,
-    urgency: body.urgency,
-    incidentDate: body.incidentDate,
-    location: body.location,
-    description: body.description,
-    additionalContext: body.additionalContext,
-    files: [],
+    encryptedPayload: body.encryptedPayload,
+    evidenceBlobs: [],
+    evidenceMeta: [],
+    forbiddenFieldsPresent,
   };
 }
 
-/** Anonymous encrypted complaint intake (never stores plaintext complaint fields). */
+/**
+ * Anonymous encrypted complaint intake (C1).
+ * Accepts ONLY browser-encrypted AES-256-GCM envelopes and encrypted AWZ1 evidence blobs.
+ * Never receives plaintext descriptions, raw evidence files, or AES keys.
+ */
 export async function POST(request: Request) {
   const rate = checkRateLimit(
     getRateLimitClientKey(request.headers, "submit-complaint"),
@@ -77,7 +120,10 @@ export async function POST(request: Request) {
 
   if (!rate.allowed) {
     return NextResponse.json(
-      { error: "Too many submissions from this network. Please wait before trying again." },
+      {
+        error:
+          "Too many submissions from this network. Please wait before trying again.",
+      },
       { status: 429 }
     );
   }
@@ -92,9 +138,9 @@ export async function POST(request: Request) {
     );
   }
 
-  let parsed: ParsedSubmission;
+  let parsed: ParsedEncryptedSubmission;
   try {
-    parsed = await parseRequestBody(request);
+    parsed = await parseSubmission(request);
   } catch {
     return NextResponse.json(
       { error: "Invalid request payload." },
@@ -102,59 +148,78 @@ export async function POST(request: Request) {
     );
   }
 
-  if (!isValidCategory(parsed.category)) {
-    return NextResponse.json(
-      { error: "Please select a valid incident category." },
-      { status: 400 }
-    );
-  }
-  const urgency = isValidUrgency(parsed.urgency) ? parsed.urgency : "standard";
-  if (!isIsoDateString(parsed.incidentDate)) {
-    return NextResponse.json(
-      { error: "Please provide a valid incident date (YYYY-MM-DD)." },
-      { status: 400 }
-    );
-  }
-
-  const location = readNonEmptyString(parsed.location, 2, 200);
-  const description = readNonEmptyString(parsed.description, 20, 5000);
-  const additionalContext =
-    typeof parsed.additionalContext === "string"
-      ? parsed.additionalContext.trim().slice(0, 3000)
-      : "";
-
-  if (!location || !description) {
+  if (parsed.forbiddenFieldsPresent.length > 0) {
     return NextResponse.json(
       {
         error:
-          "Location (2-200 chars) and incident description (20-5000 chars) are required.",
+          "Plaintext complaint fields and encryption keys are rejected. Encrypt everything in the browser before submitting.",
       },
       { status: 400 }
     );
   }
 
-  if (parsed.files.length > MAX_EVIDENCE_FILES) {
+  if (!isUuid(parsed.complaintId)) {
     return NextResponse.json(
-      { error: `Maximum ${MAX_EVIDENCE_FILES} evidence files allowed per submission.` },
+      { error: "Valid complaintId UUID is required for AAD verification." },
+      { status: 400 }
+    );
+  }
+  const complaintId = (parsed.complaintId as string).trim();
+
+  const rawCategory =
+    typeof parsed.category === "string" ? parsed.category.trim() : "";
+  const isDbCategory =
+    rawCategory === "ragging" || rawCategory === "harassment";
+  if (!isDbCategory && !isValidCategory(rawCategory)) {
+    return NextResponse.json(
+      { error: "Please select a valid incident category." },
+      { status: 400 }
+    );
+  }
+  const dbCategory = isDbCategory
+    ? (rawCategory as "ragging" | "harassment")
+    : mapUiCategoryToDbCategory(rawCategory);
+
+  if (parsed.evidenceBlobs.length > MAX_EVIDENCE_FILES) {
+    return NextResponse.json(
+      {
+        error: `Maximum ${MAX_EVIDENCE_FILES} encrypted evidence files allowed per submission.`,
+      },
       { status: 400 }
     );
   }
 
-  for (const file of parsed.files) {
-    if (file.size > MAX_EVIDENCE_BYTES) {
-      return NextResponse.json(
-        { error: `File "${file.name}" exceeds the 5 MB limit.` },
-        { status: 400 }
-      );
-    }
-    if (!ALLOWED_EVIDENCE_MIME_TYPES.has(file.type)) {
+  if (
+    !Array.isArray(parsed.evidenceMeta) ||
+    parsed.evidenceMeta.length !== parsed.evidenceBlobs.length
+  ) {
+    return NextResponse.json(
+      { error: "Encrypted evidence metadata count does not match uploaded blobs." },
+      { status: 400 }
+    );
+  }
+
+  const evidenceMetaList: EvidenceMetadataInput[] = [];
+  for (const item of parsed.evidenceMeta) {
+    const record = item as Record<string, unknown>;
+    if (
+      !record ||
+      !isUuid(record.fileId) ||
+      typeof record.mimeType !== "string" ||
+      !ALLOWED_EVIDENCE_MIME_TYPES.has(record.mimeType)
+    ) {
       return NextResponse.json(
         {
-          error: `Unsupported file type (${file.type || "unknown"}). Allowed: PNG, JPEG, WEBP, PDF, TXT.`,
+          error:
+            "Invalid evidence metadata. Allowed MIME types: PNG, JPEG, WEBP, PDF, TXT.",
         },
         { status: 400 }
       );
     }
+    evidenceMetaList.push({
+      fileId: (record.fileId as string).trim(),
+      mimeType: record.mimeType,
+    });
   }
 
   const admin = createAdminClient();
@@ -166,24 +231,23 @@ export async function POST(request: Request) {
 
   if (committeeError) {
     return NextResponse.json(
-      { error: "Failed to load committee encryption keys." },
+      { error: "Failed to load active committee members." },
       { status: 500 }
     );
   }
 
-  const recipients: CommitteeRecipientKey[] = (committeeRows ?? [])
-    .filter(
-      (row): row is { user_id: string; public_key: string } =>
-        typeof row.user_id === "string" &&
-        typeof row.public_key === "string" &&
-        isValidRsaPublicKeyPem(row.public_key)
-    )
-    .map((row) => ({
-      memberId: row.user_id,
-      publicKeyPem: row.public_key,
-    }));
+  const activeMemberIds = new Set(
+    (committeeRows ?? [])
+      .filter(
+        (row): row is { user_id: string; public_key: string } =>
+          typeof row.user_id === "string" &&
+          typeof row.public_key === "string" &&
+          isValidRsaPublicKeyPem(row.public_key)
+      )
+      .map((row) => row.user_id)
+  );
 
-  if (recipients.length < REQUIRED_UNLOCK_APPROVALS) {
+  if (activeMemberIds.size < REQUIRED_UNLOCK_APPROVALS) {
     return NextResponse.json(
       {
         error: `Encrypted intake requires at least ${REQUIRED_UNLOCK_APPROVALS} active committee members with registered RSA public keys.`,
@@ -192,37 +256,62 @@ export async function POST(request: Request) {
     );
   }
 
-  const complaintId = crypto.randomUUID();
+  const envelopeCheck = validateEncryptedComplaintEnvelope(
+    parsed.encryptedPayload,
+    activeMemberIds
+  );
+  if (!envelopeCheck.ok) {
+    return NextResponse.json({ error: envelopeCheck.error }, { status: 400 });
+  }
+
+  const preparedEvidence: Array<{
+    fileId: string;
+    mimeType: string;
+    encryptedBytes: Buffer;
+    ciphertextHash: string;
+  }> = [];
+
+  for (let i = 0; i < parsed.evidenceBlobs.length; i++) {
+    const blobFile = parsed.evidenceBlobs[i];
+    const meta = evidenceMetaList[i];
+    if (blobFile.size > MAX_EVIDENCE_BYTES + 65536) {
+      return NextResponse.json(
+        { error: "Encrypted evidence blob exceeds maximum allowed size." },
+        { status: 400 }
+      );
+    }
+
+    const encryptedBytes = Buffer.from(await blobFile.arrayBuffer());
+    const blobCheck = validateEncryptedEvidenceBlob(
+      encryptedBytes,
+      complaintId,
+      meta.fileId,
+      activeMemberIds
+    );
+    if (!blobCheck.ok) {
+      return NextResponse.json({ error: blobCheck.error }, { status: 400 });
+    }
+
+    preparedEvidence.push({
+      fileId: meta.fileId,
+      mimeType: meta.mimeType,
+      encryptedBytes,
+      ciphertextHash: blobCheck.ciphertextHash,
+    });
+  }
+
   const tracking = generateTrackingCredentials();
   const nowIso = new Date().toISOString();
   const retentionUntil = new Date(
     Date.now() + 365 * 24 * 60 * 60 * 1000
   ).toISOString();
 
-  const dbCategory = mapUiCategoryToDbCategory(parsed.category.trim());
-
-  const sensitivePayload = {
-    detailedCategory: parsed.category.trim(),
-    urgency,
-    incidentDate: parsed.incidentDate.trim(),
-    location,
-    description,
-    additionalContext,
-    evidenceFileNames: parsed.files.map((f) => f.name),
-  };
-
-  const envelope = encryptComplaintPayload(
-    sensitivePayload,
-    complaintId,
-    recipients
-  );
-
   const { error: insertError } = await admin.from("complaints").insert({
     id: complaintId,
     case_code_hash: tracking.caseCodeHash,
     recovery_secret_hash: tracking.recoverySecretHash,
     category: dbCategory,
-    encrypted_payload: JSON.stringify(envelope),
+    encrypted_payload: JSON.stringify(envelopeCheck.envelope),
     encryption_algorithm: ENCRYPTION_ALGORITHM,
     status: "submitted",
     retention_until: retentionUntil,
@@ -231,27 +320,19 @@ export async function POST(request: Request) {
   });
 
   if (insertError) {
+    const status = insertError.code === "23505" ? 409 : 500;
     return NextResponse.json(
       { error: `Failed to store encrypted complaint: ${insertError.message}` },
-      { status: 500 }
+      { status }
     );
   }
 
   let uploadedCount = 0;
-  for (const file of parsed.files) {
-    const fileId = crypto.randomUUID();
-    const rawBuffer = Buffer.from(await file.arrayBuffer());
-    const { encryptedBlob, ciphertextHash } = encryptEvidenceBuffer(
-      rawBuffer,
-      complaintId,
-      fileId,
-      recipients
-    );
-    const storagePath = `complaints/${complaintId}/${fileId}.enc`;
-
+  for (const item of preparedEvidence) {
+    const storagePath = `complaints/${complaintId}/${item.fileId}.enc`;
     const { error: uploadError } = await admin.storage
       .from(EVIDENCE_BUCKET_NAME)
-      .upload(storagePath, encryptedBlob, {
+      .upload(storagePath, item.encryptedBytes, {
         contentType: "application/octet-stream",
         upsert: false,
       });
@@ -268,12 +349,12 @@ export async function POST(request: Request) {
     }
 
     const { error: evidenceError } = await admin.from("evidence_files").insert({
-      id: fileId,
+      id: item.fileId,
       complaint_id: complaintId,
       storage_path: storagePath,
-      mime_type: file.type,
-      file_size: encryptedBlob.length,
-      file_hash: ciphertextHash,
+      mime_type: item.mimeType,
+      file_size: item.encryptedBytes.length,
+      file_hash: item.ciphertextHash,
       created_at: nowIso,
     });
 
@@ -293,8 +374,9 @@ export async function POST(request: Request) {
     eventDetails: {
       category: dbCategory,
       encryptionAlgorithm: ENCRYPTION_ALGORITHM,
+      clientEncrypted: true,
       evidenceCount: uploadedCount,
-      threshold: `${REQUIRED_UNLOCK_APPROVALS}-of-${recipients.length}`,
+      threshold: `${REQUIRED_UNLOCK_APPROVALS}-of-${Object.keys(envelopeCheck.envelope.shares).length}`,
     },
   });
 

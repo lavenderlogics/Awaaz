@@ -7,6 +7,16 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { FormField, Input, Select, Textarea } from "@/components/ui/FormField";
 import { StatusNotice } from "@/components/ui/StatusNotice";
 import { INCIDENT_CATEGORIES, URGENCY_LEVELS } from "@/lib/constants";
+import {
+  encryptComplaintInBrowser,
+  encryptEvidenceBytesInBrowser,
+  type PublicCommitteeRecipient,
+} from "@/lib/security/client-crypto";
+import {
+  ALLOWED_EVIDENCE_MIME_TYPES,
+  MAX_EVIDENCE_BYTES,
+  MAX_EVIDENCE_FILES,
+} from "@/lib/security/validation";
 
 interface ReportFormState {
   category: string;
@@ -33,7 +43,11 @@ const INITIAL_STATE: ReportFormState = {
   additionalContext: "",
 };
 
-/** Anonymous encrypted complaint intake form wired to POST /api/complaints. */
+/**
+ * Anonymous client-encrypted complaint intake form.
+ * Encrypts complaint payload and evidence files inside the browser via Web Crypto
+ * before sending any data to POST /api/complaints.
+ */
 export function ReportForm() {
   const [form, setForm] = useState<ReportFormState>(INITIAL_STATE);
   const [files, setFiles] = useState<File[]>([]);
@@ -52,7 +66,7 @@ export function ReportForm() {
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const selected = Array.from(event.target.files ?? []);
     if (selected.length === 0) return;
-    setFiles((prev) => [...prev, ...selected].slice(0, 3));
+    setFiles((prev) => [...prev, ...selected].slice(0, MAX_EVIDENCE_FILES));
     event.target.value = "";
   };
 
@@ -95,18 +109,102 @@ export function ReportForm() {
       return;
     }
 
+    for (const file of files) {
+      if (file.size > MAX_EVIDENCE_BYTES) {
+        setServerError(`File "${file.name}" exceeds the 5 MB limit.`);
+        return;
+      }
+      if (!ALLOWED_EVIDENCE_MIME_TYPES.has(file.type)) {
+        setServerError(
+          `Unsupported file type (${file.type || "unknown"}). Allowed: PNG, JPEG, WEBP, PDF, TXT.`
+        );
+        return;
+      }
+    }
+
     setIsSubmitting(true);
 
     try {
-      const body = new FormData();
-      body.set("category", form.category);
-      body.set("urgency", form.urgency);
-      body.set("incidentDate", form.incidentDate);
-      body.set("location", form.location.trim());
-      body.set("description", form.description.trim());
-      body.set("additionalContext", form.additionalContext.trim());
+      // 1. Fetch validated active committee public keys
+      const keysRes = await fetch("/api/committee/public-keys", {
+        cache: "no-store",
+      });
+      const keysJson = (await keysRes.json()) as {
+        members?: PublicCommitteeRecipient[];
+        error?: string;
+      };
+
+      if (!keysRes.ok || !Array.isArray(keysJson.members)) {
+        setServerError(
+          keysJson.error ??
+            "Unable to load committee encryption keys. Submission halted safely."
+        );
+        return;
+      }
+
+      const recipients = keysJson.members;
+      if (recipients.length < 2) {
+        setServerError(
+          "At least 2 committee public keys are required for browser encryption. Submission halted safely."
+        );
+        return;
+      }
+
+      // 2. Generate complaint ID (used as AES-GCM AAD) and encrypt payload in browser
+      const complaintId = window.crypto.randomUUID();
+      const sensitivePayload = {
+        detailedCategory: form.category,
+        urgency: form.urgency,
+        incidentDate: form.incidentDate,
+        location: form.location.trim(),
+        description: form.description.trim(),
+        additionalContext: form.additionalContext.trim(),
+        evidenceFileNames: files.map((f) => f.name),
+      };
+
+      const envelope = await encryptComplaintInBrowser({
+        complaintId,
+        payload: sensitivePayload,
+        recipients,
+      });
+
+      // 3. Encrypt every evidence file individually in browser with unique IV & DEK
+      const evidenceMeta: Array<{ fileId: string; mimeType: string }> = [];
+      const encryptedEvidenceFiles: Array<{ fileId: string; blob: Blob }> = [];
+
       for (const file of files) {
-        body.append("evidence", file);
+        const fileId = window.crypto.randomUUID();
+        const rawBytes = new Uint8Array(await file.arrayBuffer());
+        const encryptedResult = await encryptEvidenceBytesInBrowser({
+          fileBytes: rawBytes,
+          mimeType: file.type,
+          complaintId,
+          fileId,
+          recipients,
+        });
+        rawBytes.fill(0);
+
+        evidenceMeta.push({
+          fileId: encryptedResult.fileId,
+          mimeType: encryptedResult.mimeType,
+        });
+        const copy = new Uint8Array(encryptedResult.encryptedBytes.byteLength);
+        copy.set(encryptedResult.encryptedBytes);
+        encryptedEvidenceFiles.push({
+          fileId: encryptedResult.fileId,
+          blob: new Blob([copy.buffer], { type: "application/octet-stream" }),
+        });
+      }
+
+      // 4. Send ONLY ciphertext envelope and encrypted evidence blobs to server
+      const body = new FormData();
+      body.set("complaintId", complaintId);
+      body.set("category", form.category);
+      body.set("encryptedPayload", JSON.stringify(envelope));
+      body.set("evidenceMeta", JSON.stringify(evidenceMeta));
+
+      for (const item of encryptedEvidenceFiles) {
+        body.append("evidence", item.blob, `${item.fileId}.enc`);
       }
 
       const res = await fetch("/api/complaints", {
@@ -125,7 +223,7 @@ export function ReportForm() {
       }
 
       setSuccessData({
-        complaintId: String(json.complaintId ?? ""),
+        complaintId: String(json.complaintId ?? complaintId),
         caseCode: String(json.caseCode ?? ""),
         recoverySecret: String(json.recoverySecret ?? ""),
         evidenceCount: Number(json.evidenceCount ?? 0),
@@ -133,7 +231,10 @@ export function ReportForm() {
       setForm(INITIAL_STATE);
       setFiles([]);
     } catch {
-      setServerError("Network error while submitting encrypted report.");
+      // Never fall back to unencrypted or server-side submission
+      setServerError(
+        "Client-side encryption failed in your browser. No complaint data was transmitted."
+      );
     } finally {
       setIsSubmitting(false);
     }
@@ -163,10 +264,11 @@ export function ReportForm() {
               title="Encrypted Complaint Submitted Successfully"
               variant="success"
             >
-              Your report payload was encrypted with <strong>AES-256-GCM</strong>{" "}
-              and split across committee keys. Save your Case ID and Recovery
-              Secret now—only their cryptographic hashes are stored, so they
-              cannot be recovered if lost.
+              Your report payload was encrypted inside your browser with{" "}
+              <strong>AES-256-GCM</strong> and split across committee keys
+              before transmission. Save your Case ID and Recovery Secret
+              now—only their cryptographic hashes are stored, so they cannot be
+              recovered if lost.
             </StatusNotice>
 
             <div className="grid gap-4 sm:grid-cols-2">
@@ -366,7 +468,7 @@ export function ReportForm() {
                     </p>
                     <p className="text-xs leading-relaxed text-slate-600">
                       Up to 3 files (PNG, JPEG, WEBP, PDF, TXT &middot; max 5 MB
-                      each). Encrypted before storage in{" "}
+                      each). Encrypted in your browser before upload to{" "}
                       <code className="font-mono">awaaz-evidence</code>.
                     </p>
                   </div>
@@ -379,7 +481,7 @@ export function ReportForm() {
                     accept="image/png,image/jpeg,image/webp,application/pdf,text/plain"
                     className="sr-only"
                     onChange={handleFileChange}
-                    disabled={isSubmitting || files.length >= 3}
+                    disabled={isSubmitting || files.length >= MAX_EVIDENCE_FILES}
                   />
                 </label>
               </div>
@@ -432,7 +534,7 @@ export function ReportForm() {
               >
                 <Send className="h-4 w-4" />
                 {isSubmitting
-                  ? "Encrypting & Submitting..."
+                  ? "Encrypting in Browser..."
                   : "Submit Anonymous Report"}
               </Button>
             </div>
