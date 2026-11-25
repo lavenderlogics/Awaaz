@@ -20,6 +20,24 @@ export interface AuditLogRow {
   created_at: string;
 }
 
+/** Produces deterministic JSON regardless of PostgreSQL jsonb key reordering. */
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalize);
+  }
+  if (value !== null && typeof value === "object") {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      const v = (value as Record<string, unknown>)[key];
+      if (v !== undefined) {
+        sorted[key] = canonicalize(v);
+      }
+    }
+    return sorted;
+  }
+  return value;
+}
+
 /** Computes a deterministic SHA-256 hash linking an audit record to the prior entry. */
 export function computeAuditEntryHash(input: {
   previousHash: string;
@@ -35,8 +53,8 @@ export function computeAuditEntryHash(input: {
       input.complaintId,
       input.actorMemberId ?? null,
       input.eventType,
-      input.eventDetails ?? {},
-      input.createdAt,
+      canonicalize(input.eventDetails ?? {}),
+      new Date(input.createdAt).toISOString(),
     ])
   );
 }
@@ -99,7 +117,7 @@ export function verifyAuditChain(rowsAscending: AuditLogRow[]): boolean {
       actorMemberId: row.actor_member_id,
       eventType: row.event_type,
       eventDetails: row.event_details,
-      createdAt: new Date(row.created_at).toISOString(),
+      createdAt: row.created_at,
     });
     if (expected !== row.entry_hash) {
       return false;
