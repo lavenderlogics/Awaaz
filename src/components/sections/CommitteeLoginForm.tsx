@@ -1,30 +1,58 @@
 "use client";
 
 import { ArrowRight, Eye, EyeOff, Lock } from "lucide-react";
+import { useRouter } from "next/navigation";
 import { type FormEvent, useState } from "react";
 import { Button, LinkButton } from "@/components/ui/Button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { FormField, Input } from "@/components/ui/FormField";
 import { StatusNotice } from "@/components/ui/StatusNotice";
+import { createClient } from "@/lib/supabase/client";
 
-/** Committee sign-in UI shell (authentication will be connected via Supabase Auth). */
+/** Committee sign-in form wired to Supabase Auth. */
 export function CommitteeLoginForm() {
+  const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState("");
-  const [submittedNotice, setSubmittedNotice] = useState(false);
 
-  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!email.trim() || !password) {
+    const trimmedEmail = email.trim();
+
+    if (!trimmedEmail || !password) {
       setError("Please enter both an institutional email and password.");
-      setSubmittedNotice(false);
       return;
     }
 
     setError("");
-    setSubmittedNotice(true);
+    setIsSubmitting(true);
+
+    try {
+      const supabase = createClient();
+      const { error: authError } = await supabase.auth.signInWithPassword({
+        email: trimmedEmail,
+        password,
+      });
+
+      if (authError) {
+        setError(authError.message);
+        return;
+      }
+
+      router.push("/committee/dashboard");
+      router.refresh();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to connect to Supabase authentication."
+      );
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -49,6 +77,7 @@ export function CommitteeLoginForm() {
               placeholder="committee@college.edu"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
+              disabled={isSubmitting}
             />
           </FormField>
 
@@ -62,6 +91,7 @@ export function CommitteeLoginForm() {
                 className="pr-10"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
+                disabled={isSubmitting}
               />
               <button
                 type="button"
@@ -79,25 +109,20 @@ export function CommitteeLoginForm() {
           </FormField>
 
           {error ? (
-            <p className="text-xs font-medium text-red-700" role="alert">
+            <StatusNotice title="Sign-In Failed" variant="warning">
               {error}
-            </p>
-          ) : null}
-
-          {submittedNotice ? (
-            <StatusNotice
-              title="Authentication Not Connected Yet"
-              variant="warning"
-            >
-              No credentials were verified or stored. Supabase Auth and role
-              checks will be integrated in the next phase. You can still inspect
-              the dashboard UI shell below.
             </StatusNotice>
           ) : null}
 
           <div className="space-y-3 pt-1">
-            <Button type="submit" variant="primary" size="lg" className="w-full">
-              Sign In (Auth Pending)
+            <Button
+              type="submit"
+              variant="primary"
+              size="lg"
+              className="w-full"
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? "Signing In..." : "Sign In"}
             </Button>
             <LinkButton
               href="/committee/dashboard"
@@ -105,7 +130,7 @@ export function CommitteeLoginForm() {
               size="md"
               className="w-full"
             >
-              Preview Dashboard Layout
+              View Dashboard Workspace
               <ArrowRight className="h-4 w-4" />
             </LinkButton>
           </div>

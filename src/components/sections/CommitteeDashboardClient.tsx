@@ -7,41 +7,142 @@ import {
   Database,
   Filter,
   Inbox,
+  LogOut,
   Search,
   ShieldAlert,
 } from "lucide-react";
-import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { useMemo, useState } from "react";
 import { Badge } from "@/components/ui/Badge";
+import { Button, LinkButton } from "@/components/ui/Button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Input, Select } from "@/components/ui/FormField";
 import { StatusNotice } from "@/components/ui/StatusNotice";
 import { INCIDENT_CATEGORIES, PLANNED_CASE_STAGES } from "@/lib/constants";
+import { createClient } from "@/lib/supabase/client";
+
+export interface CommitteeComplaintRow {
+  id: string;
+  caseId: string;
+  category: string;
+  location: string;
+  urgency: string;
+  status: string;
+}
+
+interface CommitteeDashboardClientProps {
+  userEmail: string | null;
+  complaints: CommitteeComplaintRow[];
+  queryError: string | null;
+}
 
 const SUMMARY_METRICS = [
-  { label: "Total Complaints", icon: ClipboardList },
-  { label: "Pending Triage", icon: Clock },
-  { label: "High Urgency", icon: ShieldAlert },
-  { label: "Resolved Cases", icon: CheckCircle2 },
-];
+  { key: "total", label: "Total Complaints", icon: ClipboardList },
+  { key: "pending", label: "Pending Triage", icon: Clock },
+  { key: "urgent", label: "High Urgency", icon: ShieldAlert },
+  { key: "resolved", label: "Resolved Cases", icon: CheckCircle2 },
+] as const;
 
-/** Committee dashboard UI shell prepared for future Supabase queries. */
-export function CommitteeDashboardClient() {
+/** Committee dashboard workspace connected to Supabase Auth and live query results. */
+export function CommitteeDashboardClient({
+  userEmail,
+  complaints,
+  queryError,
+}: CommitteeDashboardClientProps) {
+  const router = useRouter();
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("all");
   const [selectedStatus, setSelectedStatus] = useState("all");
+  const [isSigningOut, setIsSigningOut] = useState(false);
+
+  const filteredComplaints = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    return complaints.filter((row) => {
+      const matchesCategory =
+        selectedCategory === "all" || row.category === selectedCategory;
+      const matchesStatus =
+        selectedStatus === "all" ||
+        row.status.toLowerCase() === selectedStatus.toLowerCase();
+      const matchesQuery =
+        !query ||
+        row.caseId.toLowerCase().includes(query) ||
+        row.location.toLowerCase().includes(query) ||
+        row.category.toLowerCase().includes(query);
+      return matchesCategory && matchesStatus && matchesQuery;
+    });
+  }, [complaints, searchQuery, selectedCategory, selectedStatus]);
+
+  const metricCounts = useMemo(() => {
+    if (!userEmail) {
+      return { total: null, pending: null, urgent: null, resolved: null };
+    }
+    return {
+      total: complaints.length,
+      pending: complaints.filter((c) =>
+        ["submitted", "pending", "under_review"].includes(c.status.toLowerCase())
+      ).length,
+      urgent: complaints.filter((c) =>
+        ["elevated", "immediate", "high", "critical"].includes(
+          c.urgency.toLowerCase()
+        )
+      ).length,
+      resolved: complaints.filter((c) =>
+        ["resolved", "closed"].includes(c.status.toLowerCase())
+      ).length,
+    };
+  }, [complaints, userEmail]);
+
+  const handleSignOut = async () => {
+    setIsSigningOut(true);
+    try {
+      const supabase = createClient();
+      await supabase.auth.signOut();
+      router.push("/committee/login");
+      router.refresh();
+    } finally {
+      setIsSigningOut(false);
+    }
+  };
 
   return (
     <div className="space-y-8">
-      <StatusNotice title="Dashboard Shell — Supabase Not Connected" variant="navy">
-        This workspace displays the committee triage layout, filters, and
-        integration structure. Live case counts and records are intentionally
-        left empty until Supabase Auth, Database, and Row-Level Security are
-        configured.
-      </StatusNotice>
+      {userEmail ? (
+        <StatusNotice title="Connected as Committee Officer" variant="navy">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <span>
+              Authenticated via Supabase Auth as <strong>{userEmail}</strong>.
+              {queryError ? ` Query note: ${queryError}` : ""}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleSignOut}
+              disabled={isSigningOut}
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              {isSigningOut ? "Signing Out..." : "Sign Out"}
+            </Button>
+          </div>
+        </StatusNotice>
+      ) : (
+        <StatusNotice title="Committee Sign-In Required for Live Records" variant="warning">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <span>
+              Supabase is connected, and Row-Level Security blocks anonymous
+              reads on <code className="font-mono">complaints</code>. Sign in
+              with a committee account to query records.
+            </span>
+            <LinkButton href="/committee/login" variant="primary" size="sm">
+              Sign In
+            </LinkButton>
+          </div>
+        </StatusNotice>
+      )}
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         {SUMMARY_METRICS.map((metric) => {
           const Icon = metric.icon;
+          const value = metricCounts[metric.key];
           return (
             <Card key={metric.label}>
               <CardContent className="p-5">
@@ -54,10 +155,10 @@ export function CommitteeDashboardClient() {
                   </span>
                 </div>
                 <p className="mt-3 font-display text-3xl font-bold text-slate-950">
-                  &mdash;
+                  {value === null ? "\u2014" : value}
                 </p>
                 <p className="mt-1 text-xs text-slate-500">
-                  Awaiting live database query
+                  {userEmail ? "Live Supabase count" : "Requires committee session"}
                 </p>
               </CardContent>
             </Card>
@@ -72,10 +173,13 @@ export function CommitteeDashboardClient() {
               <div>
                 <CardTitle>Incoming Complaint Queue</CardTitle>
                 <p className="mt-1 text-sm text-slate-600">
-                  Filter controls ready to bind to committee report queries.
+                  Filter controls bound to loaded committee records.
                 </p>
               </div>
-              <Badge variant="slate">0 Records Loaded</Badge>
+              <Badge variant="slate">
+                {filteredComplaints.length} Record
+                {filteredComplaints.length === 1 ? "" : "s"}
+              </Badge>
             </div>
 
             <div className="mt-4 grid gap-3 sm:grid-cols-3">
@@ -129,27 +233,46 @@ export function CommitteeDashboardClient() {
                     <th className="px-6 py-3.5">Status</th>
                   </tr>
                 </thead>
-                <tbody>
-                  <tr>
-                    <td colSpan={5} className="px-6 py-14 text-center">
-                      <div className="mx-auto flex max-w-sm flex-col items-center space-y-2.5">
-                        <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-navy-50 text-navy-800">
-                          <Inbox className="h-6 w-6" />
-                        </span>
-                        <p className="text-sm font-semibold text-slate-900">
-                          No live cases connected
-                        </p>
-                        <p className="text-xs leading-relaxed text-slate-500">
-                          Active filters:{" "}
-                          <span className="font-mono text-slate-700">
-                            {selectedCategory} / {selectedStatus}
+                <tbody className="divide-y divide-slate-100">
+                  {filteredComplaints.length > 0 ? (
+                    filteredComplaints.map((row) => (
+                      <tr key={row.id} className="hover:bg-slate-50/70">
+                        <td className="px-6 py-4 font-mono text-xs font-semibold text-navy-900">
+                          {row.caseId}
+                        </td>
+                        <td className="px-6 py-4 text-slate-800">{row.category}</td>
+                        <td className="px-6 py-4 text-slate-600">{row.location}</td>
+                        <td className="px-6 py-4">
+                          <Badge variant="outline">{row.urgency}</Badge>
+                        </td>
+                        <td className="px-6 py-4">
+                          <Badge variant="navy">{row.status}</Badge>
+                        </td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={5} className="px-6 py-14 text-center">
+                        <div className="mx-auto flex max-w-sm flex-col items-center space-y-2.5">
+                          <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-navy-50 text-navy-800">
+                            <Inbox className="h-6 w-6" />
                           </span>
-                          {searchQuery ? ` / "${searchQuery}"` : ""}. Connect
-                          Supabase to populate verified committee records.
-                        </p>
-                      </div>
-                    </td>
-                  </tr>
+                          <p className="text-sm font-semibold text-slate-900">
+                            {userEmail
+                              ? "No matching complaints found"
+                              : "Sign in to load committee records"}
+                          </p>
+                          <p className="text-xs leading-relaxed text-slate-500">
+                            Active filters:{" "}
+                            <span className="font-mono text-slate-700">
+                              {selectedCategory} / {selectedStatus}
+                            </span>
+                            {searchQuery ? ` / "${searchQuery}"` : ""}.
+                          </p>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
             </div>
@@ -161,38 +284,40 @@ export function CommitteeDashboardClient() {
             <div className="flex items-center gap-2 text-navy-800">
               <Database className="h-4 w-4" />
               <span className="text-xs font-semibold tracking-wider uppercase">
-                Next Milestone
+                Supabase Status
               </span>
             </div>
-            <CardTitle className="mt-2">Planned Integration Hooks</CardTitle>
+            <CardTitle className="mt-2">Connected Integration</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3 text-sm text-slate-600">
             <div className="rounded-xl border border-slate-200 bg-white p-3.5">
               <p className="font-semibold text-slate-900">
-                1. Supabase Auth &amp; Roles
+                1. Client &amp; SSR Auth
               </p>
               <p className="mt-1 text-xs leading-relaxed">
-                Gate this route behind authenticated committee sessions before
-                loading any complaint records.
+                Configured in <code className="font-mono">src/lib/supabase/</code>{" "}
+                with session refresh in <code className="font-mono">src/proxy.ts</code>.
               </p>
             </div>
             <div className="rounded-xl border border-slate-200 bg-white p-3.5">
               <p className="font-semibold text-slate-900">
-                2. Complaints &amp; Updates Tables
+                2. Row-Level Security Active
               </p>
               <p className="mt-1 text-xs leading-relaxed">
-                Store structured report submissions and append-only status
-                transitions mapped to Case IDs.
+                Detected RLS protection on <code className="font-mono">complaints</code>,{" "}
+                <code className="font-mono">committee_members</code>, and{" "}
+                <code className="font-mono">audit_logs</code>.
               </p>
             </div>
             <div className="rounded-xl border border-slate-200 bg-white p-3.5">
               <div className="flex items-center gap-1.5 font-semibold text-slate-900">
                 <Filter className="h-3.5 w-3.5 text-navy-700" />
-                3. Row-Level Security (RLS)
+                3. Schema Mapping Ready
               </div>
               <p className="mt-1 text-xs leading-relaxed">
-                Restrict read/write access on case queues strictly to authorized
-                committee officers.
+                Share your SQL column definitions to bind{" "}
+                <code className="font-mono">/report</code> inserts and{" "}
+                <code className="font-mono">/track</code> Case ID lookups.
               </p>
             </div>
           </CardContent>

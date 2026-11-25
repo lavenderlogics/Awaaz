@@ -13,7 +13,7 @@ const COMMITTEE_LINKS = [
   { label: "Committee Dashboard", href: "/committee/dashboard" },
 ];
 
-/** Global responsive footer with platform links and honest setup status. */
+/** Global responsive footer with platform links and setup status. */
 export function Footer() {
   return (
     <footer className="border-t border-slate-200 bg-slate-50/80">
@@ -34,9 +34,9 @@ export function Footer() {
               progress.
             </p>
             <p className="max-w-md text-xs leading-relaxed text-slate-500">
-              Initial frontend architecture only. Backend persistence,
-              authentication, and database security policies will be integrated
-              with Supabase in the next milestone.
+              Supabase client and committee authentication are connected via
+              environment configuration. Client-side encryption is not claimed
+              in this setup.
             </p>
           </div>
 
@@ -88,10 +88,8 @@ export function Footer() {
         </div>
 
         <div className="mt-10 flex flex-col items-start justify-between gap-3 border-t border-slate-200 pt-6 text-xs text-slate-500 sm:flex-row sm:items-center">
-          <p>
-            Awaaz &mdash; Cybersecurity Hackathon Project (Initial Setup)
-          </p>
-          <p>Next.js App Router &middot; TypeScript &middot; Tailwind CSS</p>
+          <p>Awaaz &mdash; Cybersecurity Hackathon Project</p>
+          <p>Next.js App Router &middot; TypeScript &middot; Tailwind CSS &middot; Supabase</p>
         </div>
       </div>
     </footer>

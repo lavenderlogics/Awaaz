@@ -174,11 +174,12 @@ export default function HomePage() {
                   </div>
 
                   <StatusNotice
-                    title="Backend Integration Planned"
+                    title="Supabase Client &amp; Auth Connected"
                     variant="info"
                   >
-                    No data is stored yet. Supabase tables and auth policies
-                    will be wired next.
+                    Committee authentication is wired via Supabase. Student
+                    report submission and Case ID lookup queries are ready to
+                    bind once table column definitions are mapped.
                   </StatusNotice>
                 </CardContent>
               </Card>
