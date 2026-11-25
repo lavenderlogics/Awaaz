@@ -493,6 +493,10 @@ export function generateTrackingCredentials(): {
   };
 }
 
+export function isStrictRsa2048CiphertextBase64(value: unknown): value is string {
+  return isStrictBase64WithByteLength(value, 256);
+}
+
 /** Validates that a PEM string is an RSA public key suitable for RSA-OAEP (>= 2048 bits). */
 export function isValidRsaPublicKeyPem(pem: string): boolean {
   try {

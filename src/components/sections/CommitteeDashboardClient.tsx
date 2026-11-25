@@ -10,17 +10,33 @@ import {
   LockOpen,
   LogOut,
   Search,
+  Send,
   ShieldAlert,
   ShieldCheck,
+  Upload,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { type ChangeEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { Badge } from "@/components/ui/Badge";
 import { Button, LinkButton } from "@/components/ui/Button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { FormField, Input, Select, Textarea } from "@/components/ui/FormField";
 import { StatusNotice } from "@/components/ui/StatusNotice";
 import { PLANNED_CASE_STAGES } from "@/lib/constants";
+import {
+  type BrowserDecryptableEnvelope,
+  derToPem,
+  forwardShareInBrowser,
+  importRsaOaepPrivateKeyNonExtractable,
+  type PublicCommitteeRecipient,
+  reconstructAndDecryptComplaintInBrowser,
+  verifyPrivateKeyMatchesPublicKeyInBrowser,
+} from "@/lib/security/client-crypto";
+import {
+  computePublicKeyFingerprint,
+  loadPrivateKeyFromIndexedDb,
+  savePrivateKeyToIndexedDb,
+} from "@/lib/security/committee-key-store";
 import { createClient } from "@/lib/supabase/client";
 
 interface DashboardComplaint {
@@ -33,6 +49,7 @@ interface DashboardComplaint {
   approvalCount: number;
   requiredApprovals: number;
   approvedByMe: boolean;
+  forwardedToMeCount: number;
   evidenceCount: number;
 }
 
@@ -44,6 +61,10 @@ interface CommitteeMemberSummary {
   isActive: boolean;
 }
 
+interface CurrentCommitteeMember extends CommitteeMemberSummary {
+  publicKeyPem: string | null;
+}
+
 interface AuditLogEntry {
   id: number;
   complaint_id: string;
@@ -53,15 +74,36 @@ interface AuditLogEntry {
   created_at: string;
 }
 
-interface DecryptedDetails {
+interface ForwardedShareItem {
+  senderMemberId: string;
+  ciphertextShare: string;
+  approvedAt: string | null;
+}
+
+interface UnlockBundle {
   complaintId: string;
-  payload: Record<string, unknown>;
+  category: string;
+  status: string;
+  envelope: BrowserDecryptableEnvelope;
+  myEncryptedShare: string | null;
+  forwardedSharesToMe: ForwardedShareItem[];
+  approvalSummaries: Array<{
+    memberId: string;
+    approvedAt: string | null;
+    forwardedToIds: string[];
+  }>;
   evidenceFiles: Array<{
     id: string;
     mime_type: string | null;
     file_size: number | null;
     file_hash: string | null;
   }>;
+}
+
+interface DecryptedDetails {
+  complaintId: string;
+  payload: Record<string, unknown>;
+  evidenceFiles: UnlockBundle["evidenceFiles"];
 }
 
 interface CommitteeDashboardClientProps {
@@ -71,25 +113,22 @@ interface CommitteeDashboardClientProps {
   userId: string | null;
 }
 
+type LocalKeyStatus = "checking" | "ready" | "missing" | "mismatch";
+
 const SUMMARY_METRICS = [
   { key: "total", label: "Total Complaints", icon: ClipboardList },
   { key: "pending", label: "Pending Triage", icon: Clock },
-  { key: "awaitingUnlock", label: "Awaiting 2-Key Unlock", icon: ShieldAlert },
+  { key: "awaitingUnlock", label: "Ready for Me to Decrypt", icon: ShieldAlert },
   { key: "resolved", label: "Resolved Cases", icon: CheckCircle2 },
 ] as const;
 
-function arrayBufferToPem(buffer: ArrayBuffer, label: string): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  const base64 = btoa(binary);
-  const lines = base64.match(/.{1,64}/g)?.join("\n") ?? base64;
-  return `-----BEGIN ${label}-----\n${lines}\n-----END ${label}-----`;
-}
-
-/** Protected committee dashboard connecting auth, key registration, two-key unlock, and audit logs. */
+/**
+ * Protected committee dashboard implementing C2:
+ * - Non-extractable RSA-OAEP private CryptoKeys persisted in IndexedDB only
+ * - Local private-key PEM import with challenge-response verification
+ * - Browser-side share decryption and re-encryption forwarding for recipients
+ * - Browser-side Shamir reconstruction + AES-256-GCM complaint decryption
+ */
 export function CommitteeDashboardClient({
   isConfigured,
   isServiceRoleReady,
@@ -109,33 +148,86 @@ export function CommitteeDashboardClient({
   const [complaints, setComplaints] = useState<DashboardComplaint[]>([]);
   const [members, setMembers] = useState<CommitteeMemberSummary[]>([]);
   const [currentMember, setCurrentMember] =
-    useState<CommitteeMemberSummary | null>(null);
+    useState<CurrentCommitteeMember | null>(null);
 
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
   const [auditChainValid, setAuditChainValid] = useState<boolean | null>(null);
 
-  const [selectedComplaintId, setSelectedComplaintId] = useState<string | null>(
-    null
-  );
-  const [privateKeyPem, setPrivateKeyPem] = useState("");
-  const [unlockFeedback, setUnlockFeedback] = useState("");
-  const [unlockError, setUnlockError] = useState("");
-  const [isUnlocking, setIsUnlocking] = useState(false);
-  const [decrypted, setDecrypted] = useState<DecryptedDetails | null>(null);
+  // Browser-only non-extractable private CryptoKey state
+  const [localPrivateKey, setLocalPrivateKey] = useState<CryptoKey | null>(null);
+  const [localKeyStatus, setLocalKeyStatus] =
+    useState<LocalKeyStatus>("checking");
+  const [importPemText, setImportPemText] = useState("");
+  const [importError, setImportError] = useState("");
+  const [importSuccess, setImportSuccess] = useState("");
+  const [isImportingKey, setIsImportingKey] = useState(false);
 
+  // One-time backup download state (only populated right after key generation)
   const [generatedPrivatePem, setGeneratedPrivatePem] = useState<string | null>(
     null
   );
   const [isGeneratingKey, setIsGeneratingKey] = useState(false);
   const [keyStatusMessage, setKeyStatusMessage] = useState("");
 
+  // Selected complaint C2 unlock & share-forwarding state
+  const [selectedComplaintId, setSelectedComplaintId] = useState<string | null>(
+    null
+  );
+  const [unlockBundle, setUnlockBundle] = useState<UnlockBundle | null>(null);
+  const [loadingBundle, setLoadingBundle] = useState(false);
+  const [recipientMemberId, setRecipientMemberId] = useState("");
+  const [unlockFeedback, setUnlockFeedback] = useState("");
+  const [unlockError, setUnlockError] = useState("");
+  const [isUnlocking, setIsUnlocking] = useState(false);
+  const [decrypted, setDecrypted] = useState<DecryptedDetails | null>(null);
+
+  const syncLocalKeyFromIndexedDb = useCallback(
+    async (member: CurrentCommitteeMember | null) => {
+      if (!member) {
+        setLocalPrivateKey(null);
+        setLocalKeyStatus("missing");
+        return;
+      }
+      if (!member.hasPublicKey || !member.publicKeyPem) {
+        setLocalPrivateKey(null);
+        setLocalKeyStatus("missing");
+        return;
+      }
+
+      try {
+        const entry = await loadPrivateKeyFromIndexedDb(member.userId);
+        if (!entry) {
+          setLocalPrivateKey(null);
+          setLocalKeyStatus("missing");
+          return;
+        }
+
+        const expectedFp = await computePublicKeyFingerprint(
+          member.publicKeyPem
+        );
+        if (entry.publicKeyFingerprint !== expectedFp) {
+          setLocalPrivateKey(null);
+          setLocalKeyStatus("mismatch");
+          return;
+        }
+
+        setLocalPrivateKey(entry.privateKey);
+        setLocalKeyStatus("ready");
+      } catch {
+        setLocalPrivateKey(null);
+        setLocalKeyStatus("missing");
+      }
+    },
+    []
+  );
+
   const loadDashboard = useCallback(async () => {
     if (!userEmail || !isServiceRoleReady) return;
 
     try {
       const [dashRes, auditRes] = await Promise.all([
-        fetch("/api/committee/dashboard"),
-        fetch("/api/committee/audit-logs"),
+        fetch("/api/committee/dashboard", { cache: "no-store" }),
+        fetch("/api/committee/audit-logs", { cache: "no-store" }),
       ]);
       const dashJson = (await dashRes.json()) as Record<string, unknown>;
 
@@ -159,9 +251,10 @@ export function CommitteeDashboardClient({
           ? (dashJson.members as CommitteeMemberSummary[])
           : []
       );
-      setCurrentMember(
-        (dashJson.currentMember as CommitteeMemberSummary | null) ?? null
-      );
+      const memberData =
+        (dashJson.currentMember as CurrentCommitteeMember | null) ?? null;
+      setCurrentMember(memberData);
+      await syncLocalKeyFromIndexedDb(memberData);
 
       if (auditRes.ok) {
         const auditJson = (await auditRes.json()) as Record<string, unknown>;
@@ -181,7 +274,7 @@ export function CommitteeDashboardClient({
     } finally {
       setLoadingData(false);
     }
-  }, [isServiceRoleReady, userEmail]);
+  }, [isServiceRoleReady, syncLocalKeyFromIndexedDb, userEmail]);
 
   useEffect(() => {
     if (!userEmail || !isServiceRoleReady) return;
@@ -195,6 +288,17 @@ export function CommitteeDashboardClient({
       active = false;
     };
   }, [isServiceRoleReady, loadDashboard, userEmail]);
+
+  const otherActiveMembersWithKeys = useMemo(() => {
+    if (!currentMember) return [];
+    return members.filter(
+      (m) =>
+        m.isActive && m.hasPublicKey && m.userId !== currentMember.userId
+    );
+  }, [currentMember, members]);
+
+  const effectiveRecipientId =
+    recipientMemberId || otherActiveMembersWithKeys[0]?.userId || "";
 
   const filteredComplaints = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
@@ -225,9 +329,8 @@ export function CommitteeDashboardClient({
       pending: complaints.filter((c) =>
         ["submitted", "under_review"].includes(c.status)
       ).length,
-      awaitingUnlock: complaints.filter(
-        (c) => c.approvalCount < c.requiredApprovals
-      ).length,
+      awaitingUnlock: complaints.filter((c) => c.forwardedToMeCount >= 1)
+        .length,
       resolved: complaints.filter((c) =>
         ["resolved", "closed"].includes(c.status)
       ).length,
@@ -235,9 +338,12 @@ export function CommitteeDashboardClient({
   }, [complaints, currentMember, userEmail]);
 
   const handleGenerateAndRegisterKey = async () => {
+    if (!currentMember) return;
     setIsGeneratingKey(true);
     setKeyStatusMessage("");
     setApiError("");
+    setImportError("");
+    setImportSuccess("");
 
     try {
       const keyPair = await window.crypto.subtle.generateKey(
@@ -251,14 +357,23 @@ export function CommitteeDashboardClient({
         ["encrypt", "decrypt"]
       );
 
-      const spki = await window.crypto.subtle.exportKey("spki", keyPair.publicKey);
+      const spki = await window.crypto.subtle.exportKey(
+        "spki",
+        keyPair.publicKey
+      );
       const pkcs8 = await window.crypto.subtle.exportKey(
         "pkcs8",
         keyPair.privateKey
       );
 
-      const publicKeyPem = arrayBufferToPem(spki, "PUBLIC KEY");
-      const privateKey = arrayBufferToPem(pkcs8, "PRIVATE KEY");
+      const publicKeyPem = derToPem(spki, "PUBLIC KEY");
+      const privateKeyBackupPem = derToPem(pkcs8, "PRIVATE KEY");
+
+      // Re-import as non-extractable CryptoKey for IndexedDB persistence
+      const nonExtractableKey = await importRsaOaepPrivateKeyNonExtractable(
+        privateKeyBackupPem
+      );
+      new Uint8Array(pkcs8).fill(0);
 
       const res = await fetch("/api/committee/keys", {
         method: "POST",
@@ -276,9 +391,16 @@ export function CommitteeDashboardClient({
         return;
       }
 
-      setGeneratedPrivatePem(privateKey);
+      const fingerprint = await computePublicKeyFingerprint(publicKeyPem);
+      await savePrivateKeyToIndexedDb({
+        memberId: currentMember.userId,
+        privateKey: nonExtractableKey,
+        publicKeyFingerprint: fingerprint,
+      });
+
+      setGeneratedPrivatePem(privateKeyBackupPem);
       setKeyStatusMessage(
-        "RSA-2048 public key saved to committee_members. Download and keep your private key PEM safely—it is never stored on the server."
+        "RSA-2048 public key saved to committee_members, and your non-extractable private key is stored in IndexedDB. Download a PEM backup if you need to use another browser."
       );
       await loadDashboard();
     } catch {
@@ -299,55 +421,232 @@ export function CommitteeDashboardClient({
     link.download = "awaaz-committee-private-key.pem";
     link.click();
     URL.revokeObjectURL(url);
+    // Clear one-time backup string from React state after download
+    setGeneratedPrivatePem(null);
   };
 
-  const handleUnlockOrApprove = async (complaintId: string) => {
+  const handleImportPemFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const text = await file.text();
+    setImportPemText(text);
+    event.target.value = "";
+  };
+
+  const handleImportExistingPrivateKey = async () => {
+    if (!currentMember || !currentMember.publicKeyPem) {
+      setImportError(
+        "No public key is registered on the server for your account yet."
+      );
+      return;
+    }
+
+    const trimmedPem = importPemText.trim();
+    if (!trimmedPem) {
+      setImportError("Paste or select your PKCS#8 private key PEM first.");
+      return;
+    }
+
+    setIsImportingKey(true);
+    setImportError("");
+    setImportSuccess("");
+
+    try {
+      const nonExtractableKey =
+        await importRsaOaepPrivateKeyNonExtractable(trimmedPem);
+      const matches = await verifyPrivateKeyMatchesPublicKeyInBrowser(
+        nonExtractableKey,
+        currentMember.publicKeyPem
+      );
+
+      if (!matches) {
+        setImportError(
+          "This private key does not match your registered public key. Nothing was saved or transmitted."
+        );
+        return;
+      }
+
+      const fingerprint = await computePublicKeyFingerprint(
+        currentMember.publicKeyPem
+      );
+      await savePrivateKeyToIndexedDb({
+        memberId: currentMember.userId,
+        privateKey: nonExtractableKey,
+        publicKeyFingerprint: fingerprint,
+      });
+
+      setImportPemText("");
+      setImportSuccess(
+        "Private key verified locally and stored as a non-extractable CryptoKey in IndexedDB."
+      );
+      await syncLocalKeyFromIndexedDb(currentMember);
+    } catch {
+      setImportError(
+        "Invalid PKCS#8 private key PEM. Ensure it starts with -----BEGIN PRIVATE KEY-----."
+      );
+    } finally {
+      setIsImportingKey(false);
+    }
+  };
+
+  const loadComplaintUnlockBundle = async (complaintId: string) => {
+    setSelectedComplaintId(complaintId);
+    setLoadingBundle(true);
+    setUnlockError("");
+    setUnlockFeedback("");
+    setDecrypted(null);
+    setUnlockBundle(null);
+
+    try {
+      const res = await fetch(
+        `/api/committee/unlock?complaintId=${encodeURIComponent(complaintId)}`,
+        { cache: "no-store" }
+      );
+      const json = (await res.json()) as Record<string, unknown>;
+      if (!res.ok) {
+        setUnlockError(
+          typeof json.error === "string"
+            ? json.error
+            : "Failed to load encrypted share data."
+        );
+        return;
+      }
+
+      setUnlockBundle(json as unknown as UnlockBundle);
+    } catch {
+      setUnlockError("Network error while loading encrypted share bundle.");
+    } finally {
+      setLoadingBundle(false);
+    }
+  };
+
+  const handleForwardShare = async () => {
+    if (!unlockBundle || !localPrivateKey || !effectiveRecipientId) return;
+    if (!unlockBundle.myEncryptedShare) {
+      setUnlockError(
+        "This complaint does not include a wrapped share for your account."
+      );
+      return;
+    }
+
     setIsUnlocking(true);
     setUnlockError("");
     setUnlockFeedback("");
 
     try {
+      const keysRes = await fetch("/api/committee/public-keys", {
+        cache: "no-store",
+      });
+      const keysJson = (await keysRes.json()) as {
+        members?: PublicCommitteeRecipient[];
+        error?: string;
+      };
+
+      if (!keysRes.ok || !Array.isArray(keysJson.members)) {
+        setUnlockError(
+          keysJson.error ?? "Unable to fetch recipient public key."
+        );
+        return;
+      }
+
+      const recipient = keysJson.members.find(
+        (m) => m.memberId === effectiveRecipientId
+      );
+      if (!recipient) {
+        setUnlockError(
+          "Selected recipient does not have an active RSA-OAEP public key."
+        );
+        return;
+      }
+
+      const encryptedForwardedShare = await forwardShareInBrowser({
+        myEncryptedShareBase64: unlockBundle.myEncryptedShare,
+        myPrivateKey: localPrivateKey,
+        recipientPublicKeyPem: recipient.publicKey,
+      });
+
       const res = await fetch("/api/committee/unlock", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          complaintId,
-          privateKeyPem: privateKeyPem.trim() || undefined,
+          complaintId: unlockBundle.complaintId,
+          recipientMemberId: effectiveRecipientId,
+          encryptedForwardedShare,
         }),
       });
       const json = (await res.json()) as Record<string, unknown>;
 
       if (!res.ok) {
         setUnlockError(
-          typeof json.error === "string" ? json.error : "Unlock failed."
+          typeof json.error === "string"
+            ? json.error
+            : "Failed to submit encrypted forwarded share."
         );
         return;
       }
 
-      if (json.unlocked === true) {
-        setDecrypted({
-          complaintId,
-          payload: (json.payload as Record<string, unknown>) ?? {},
-          evidenceFiles: Array.isArray(json.evidenceFiles)
-            ? (json.evidenceFiles as DecryptedDetails["evidenceFiles"])
-            : [],
-        });
-        setUnlockFeedback(
-          "Dual-key threshold met (2 approvals). AES-256-GCM payload decrypted."
-        );
-      } else {
-        setDecrypted(null);
-        setUnlockFeedback(
-          `Approval recorded (${String(json.approvalsCount ?? 1)}/${String(
-            json.requiredApprovals ?? 2
-          )}). A second committee member must approve to decrypt.`
-        );
-      }
-
-      setPrivateKeyPem("");
-      await loadDashboard();
+      const recipientName =
+        members.find((m) => m.userId === effectiveRecipientId)?.fullName ??
+        effectiveRecipientId;
+      setUnlockFeedback(
+        `Your share was decrypted locally and forwarded encrypted for ${recipientName}. No plaintext key or share left your browser.`
+      );
+      await Promise.all([
+        loadDashboard(),
+        loadComplaintUnlockBundle(unlockBundle.complaintId),
+      ]);
     } catch {
-      setUnlockError("Network error while submitting unlock request.");
+      setUnlockError(
+        "Local share decryption failed. Check that your IndexedDB key matches this complaint's encryption key."
+      );
+    } finally {
+      setIsUnlocking(false);
+    }
+  };
+
+  const handleDecryptLocally = async () => {
+    if (!unlockBundle || !localPrivateKey) return;
+    if (!unlockBundle.myEncryptedShare) {
+      setUnlockError(
+        "This complaint does not include a wrapped share for your account."
+      );
+      return;
+    }
+    if (unlockBundle.forwardedSharesToMe.length === 0) {
+      setUnlockError(
+        "At least 1 other committee member must forward their encrypted share to you before you can decrypt."
+      );
+      return;
+    }
+
+    setIsUnlocking(true);
+    setUnlockError("");
+    setUnlockFeedback("");
+
+    try {
+      const { payload } = await reconstructAndDecryptComplaintInBrowser({
+        complaintId: unlockBundle.complaintId,
+        envelope: unlockBundle.envelope,
+        myEncryptedShareBase64: unlockBundle.myEncryptedShare,
+        forwardedEncryptedSharesBase64: unlockBundle.forwardedSharesToMe.map(
+          (f) => f.ciphertextShare
+        ),
+        myPrivateKey: localPrivateKey,
+      });
+
+      setDecrypted({
+        complaintId: unlockBundle.complaintId,
+        payload,
+        evidenceFiles: unlockBundle.evidenceFiles,
+      });
+      setUnlockFeedback(
+        "AES-256 key reconstructed via Shamir GF(256) and complaint decrypted strictly inside your browser."
+      );
+    } catch {
+      setDecrypted(null);
+      setUnlockError(
+        "Local decryption failed. Ensure your IndexedDB private key matches and the forwarded share came from a valid co-approver."
+      );
     } finally {
       setIsUnlocking(false);
     }
@@ -437,7 +736,8 @@ export function CommitteeDashboardClient({
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <span>
               Signed in as <strong>{userEmail}</strong> (
-              {currentMember?.role ?? "Committee"}).
+              {currentMember?.role ?? "Committee"}). Zero-knowledge browser key
+              mode active.
             </span>
             <Button
               variant="outline"
@@ -490,8 +790,8 @@ export function CommitteeDashboardClient({
               <div>
                 <CardTitle>Encrypted Complaint Queue</CardTitle>
                 <p className="mt-1 text-sm text-slate-600">
-                  Complaint payloads remain encrypted until 2 committee members
-                  approve unlock.
+                  Private keys never leave your browser. Forward or combine
+                  encrypted shares locally to decrypt.
                 </p>
               </div>
               <Badge variant="slate">
@@ -543,7 +843,7 @@ export function CommitteeDashboardClient({
                   <tr>
                     <th className="px-5 py-3.5">Complaint ID</th>
                     <th className="px-5 py-3.5">Category</th>
-                    <th className="px-5 py-3.5">Approvals</th>
+                    <th className="px-5 py-3.5">Key Shares</th>
                     <th className="px-5 py-3.5">Status</th>
                     <th className="px-5 py-3.5">Action</th>
                   </tr>
@@ -565,12 +865,14 @@ export function CommitteeDashboardClient({
                         <td className="px-5 py-4">
                           <Badge
                             variant={
-                              row.approvalCount >= row.requiredApprovals
+                              row.forwardedToMeCount >= 1
                                 ? "emerald"
                                 : "amber"
                             }
                           >
-                            {row.approvalCount}/{row.requiredApprovals} Keys
+                            {row.forwardedToMeCount >= 1
+                              ? `${row.forwardedToMeCount} Forwarded to You`
+                              : `${row.approvalCount} Shared`}
                           </Badge>
                         </td>
                         <td className="px-5 py-4">
@@ -594,17 +896,12 @@ export function CommitteeDashboardClient({
                             type="button"
                             variant="outline"
                             size="sm"
-                            onClick={() => {
-                              setSelectedComplaintId(row.id);
-                              setUnlockError("");
-                              setUnlockFeedback("");
-                              setDecrypted(null);
-                            }}
+                            onClick={() => void loadComplaintUnlockBundle(row.id)}
                           >
                             <LockOpen className="h-3.5 w-3.5" />
-                            {row.approvalCount >= row.requiredApprovals
-                              ? "Decrypt"
-                              : "Approve"}
+                            {row.forwardedToMeCount >= 1
+                              ? "Unlock"
+                              : "Forward Share"}
                           </Button>
                         </td>
                       </tr>
@@ -643,7 +940,7 @@ export function CommitteeDashboardClient({
             <div className="flex items-center gap-2 text-navy-800">
               <KeyRound className="h-4 w-4" />
               <span className="text-xs font-semibold tracking-wider uppercase">
-                Two-Key Setup
+                Browser Keystore (IndexedDB)
               </span>
             </div>
             <CardTitle className="mt-2">Committee Key Readiness</CardTitle>
@@ -651,39 +948,133 @@ export function CommitteeDashboardClient({
           <CardContent className="space-y-4 text-sm text-slate-600">
             {currentMember ? (
               <div className="space-y-3">
-                <Button
-                  type="button"
-                  variant="primary"
-                  size="sm"
-                  className="w-full"
-                  disabled={isGeneratingKey}
-                  onClick={handleGenerateAndRegisterKey}
-                >
-                  <KeyRound className="h-3.5 w-3.5" />
-                  {isGeneratingKey
-                    ? "Generating RSA-2048 Key..."
-                    : currentMember.hasPublicKey
-                      ? "Rotate My RSA Public Key"
-                      : "Generate & Register My Key"}
-                </Button>
+                <div className="rounded-xl border border-slate-200 bg-white p-3 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-slate-900">
+                      Your Browser Key:
+                    </span>
+                    <Badge
+                      variant={
+                        localKeyStatus === "ready" ? "emerald" : "amber"
+                      }
+                    >
+                      {localKeyStatus === "ready"
+                        ? "Non-Extractable Ready"
+                        : localKeyStatus === "mismatch"
+                          ? "Key Mismatch"
+                          : localKeyStatus === "checking"
+                            ? "Checking..."
+                            : "Not in Browser"}
+                    </Badge>
+                  </div>
+                  {currentMember.hasPublicKey && localKeyStatus !== "ready" ? (
+                    <p className="mt-2 leading-relaxed text-amber-800">
+                      {localKeyStatus === "mismatch"
+                        ? "Your IndexedDB key does not match the registered public key. Import your matching .pem backup below. Rotating generates a new key only for future complaints."
+                        : "Your public key is registered, but this browser has no matching private key. Import your .pem backup locally below—do not rotate unless you want a new key for future complaints only."}
+                    </p>
+                  ) : null}
+                </div>
 
-                {generatedPrivatePem ? (
+                {!currentMember.hasPublicKey ? (
+                  <Button
+                    type="button"
+                    variant="primary"
+                    size="sm"
+                    className="w-full"
+                    disabled={isGeneratingKey}
+                    onClick={handleGenerateAndRegisterKey}
+                  >
+                    <KeyRound className="h-3.5 w-3.5" />
+                    {isGeneratingKey
+                      ? "Generating RSA-2048 Key..."
+                      : "Generate & Register My Key"}
+                  </Button>
+                ) : (
                   <Button
                     type="button"
                     variant="outline"
                     size="sm"
                     className="w-full"
+                    disabled={isGeneratingKey}
+                    onClick={handleGenerateAndRegisterKey}
+                  >
+                    <KeyRound className="h-3.5 w-3.5" />
+                    {isGeneratingKey
+                      ? "Rotating Key..."
+                      : "Rotate Key (Future Complaints Only)"}
+                  </Button>
+                )}
+
+                {generatedPrivatePem ? (
+                  <Button
+                    type="button"
+                    variant="primary"
+                    size="sm"
+                    className="w-full"
                     onClick={downloadPrivateKey}
                   >
                     <Download className="h-3.5 w-3.5" />
-                    Download Private Key (.pem)
+                    Download Private Key Backup (.pem)
                   </Button>
                 ) : null}
 
                 {keyStatusMessage ? (
-                  <StatusNotice title="Public Key Saved" variant="success">
+                  <StatusNotice title="Key Registered" variant="success">
                     {keyStatusMessage}
                   </StatusNotice>
+                ) : null}
+
+                {currentMember.hasPublicKey && localKeyStatus !== "ready" ? (
+                  <div className="space-y-2.5 rounded-xl border border-slate-200 bg-white p-3">
+                    <p className="text-xs font-semibold text-slate-900">
+                      Import Existing Private Key Locally
+                    </p>
+                    <p className="text-[11px] leading-relaxed text-slate-500">
+                      Imported directly into a non-extractable IndexedDB
+                      CryptoKey. Never leaves your browser.
+                    </p>
+                    <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-slate-300 bg-slate-50 px-2.5 py-1.5 text-xs font-medium text-navy-900 hover:bg-slate-100">
+                      <Upload className="h-3.5 w-3.5" />
+                      Load .pem File
+                      <input
+                        type="file"
+                        accept=".pem,.key,.txt"
+                        className="sr-only"
+                        onChange={(e) => void handleImportPemFile(e)}
+                      />
+                    </label>
+                    <Textarea
+                      id="localImportPem"
+                      className="min-h-20 font-mono text-[11px]"
+                      placeholder="-----BEGIN PRIVATE KEY-----"
+                      value={importPemText}
+                      onChange={(e) => setImportPemText(e.target.value)}
+                      disabled={isImportingKey}
+                    />
+                    <Button
+                      type="button"
+                      variant="primary"
+                      size="sm"
+                      className="w-full"
+                      disabled={isImportingKey || !importPemText.trim()}
+                      onClick={() => void handleImportExistingPrivateKey()}
+                    >
+                      {isImportingKey
+                        ? "Verifying & Importing..."
+                        : "Import into IndexedDB"}
+                    </Button>
+                    {importError ? (
+                      <p className="text-xs font-medium text-red-700">
+                        {importError}
+                      </p>
+                    ) : null}
+                    {importSuccess ? (
+                      <p className="text-xs font-medium text-emerald-700">
+                        {importSuccess}
+                      </p>
+                    ) : null}
+                  </div>
                 ) : null}
               </div>
             ) : null}
@@ -716,60 +1107,172 @@ export function CommitteeDashboardClient({
             <div className="flex items-center justify-between gap-3">
               <div>
                 <CardTitle>
-                  Dual-Key Unlock &amp; Decryption ({selectedComplaintId})
+                  Browser-Side Unlock &amp; Share Forwarding (
+                  {selectedComplaintId})
                 </CardTitle>
                 <p className="mt-1 text-sm text-slate-600">
-                  Submit your RSA private key in memory to approve this unlock,
-                  or click Decrypt directly if 2 committee members have already
-                  approved.
+                  Private keys, Shamir shares, and decrypted complaints never
+                  leave your browser.
                 </p>
               </div>
               <Button
                 type="button"
                 variant="ghost"
                 size="sm"
-                onClick={() => setSelectedComplaintId(null)}
+                onClick={() => {
+                  setSelectedComplaintId(null);
+                  setUnlockBundle(null);
+                  setDecrypted(null);
+                }}
               >
                 Close
               </Button>
             </div>
           </CardHeader>
-          <CardContent className="space-y-4 pt-6">
-            <FormField
-              id="privateKeyPem"
-              label="Your RSA Private Key PEM (Optional if already 2 approvals)"
-              hint="Processed in server memory only to unwrap your Shamir share; never stored."
-            >
-              <Textarea
-                id="privateKeyPem"
-                className="min-h-24 font-mono text-xs"
-                placeholder="-----BEGIN PRIVATE KEY-----"
-                value={privateKeyPem}
-                onChange={(e) => setPrivateKeyPem(e.target.value)}
-                disabled={isUnlocking}
-              />
-            </FormField>
+          <CardContent className="space-y-5 pt-6">
+            {loadingBundle ? (
+              <p className="text-sm text-slate-600">
+                Loading encrypted share bundle...
+              </p>
+            ) : unlockBundle ? (
+              <div className="grid gap-6 md:grid-cols-2">
+                {/* Step B & C: Forward my share to another committee member */}
+                <div className="space-y-3 rounded-xl border border-slate-200 bg-slate-50/70 p-4">
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-sm font-semibold text-navy-950">
+                      1. Approve &amp; Forward Your Encrypted Share
+                    </h4>
+                    <Badge
+                      variant={
+                        unlockBundle.myEncryptedShare ? "navy" : "amber"
+                      }
+                    >
+                      {unlockBundle.myEncryptedShare
+                        ? "Share Available"
+                        : "No Share"}
+                    </Badge>
+                  </div>
+                  <p className="text-xs leading-relaxed text-slate-600">
+                    Decrypts your share locally with your IndexedDB key,
+                    re-encrypts it for the selected co-approver&apos;s public
+                    key, and forwards only ciphertext.
+                  </p>
 
-            <div className="flex flex-wrap gap-3">
-              <Button
-                type="button"
-                variant="primary"
-                disabled={isUnlocking}
-                onClick={() => void handleUnlockOrApprove(selectedComplaintId)}
-              >
-                <LockOpen className="h-4 w-4" />
-                {isUnlocking ? "Verifying Key..." : "Approve / Decrypt Complaint"}
-              </Button>
-            </div>
+                  <FormField
+                    id="recipientMemberId"
+                    label="Forward To Committee Officer"
+                  >
+                    <Select
+                      id="recipientMemberId"
+                      value={effectiveRecipientId}
+                      onChange={(e) => setRecipientMemberId(e.target.value)}
+                      disabled={
+                        isUnlocking || otherActiveMembersWithKeys.length === 0
+                      }
+                    >
+                      {otherActiveMembersWithKeys.length === 0 ? (
+                        <option value="">No other active members with keys</option>
+                      ) : (
+                        otherActiveMembersWithKeys.map((m) => (
+                          <option key={m.userId} value={m.userId}>
+                            {m.fullName} ({m.role})
+                          </option>
+                        ))
+                      )}
+                    </Select>
+                  </FormField>
+
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={
+                      isUnlocking ||
+                      localKeyStatus !== "ready" ||
+                      !unlockBundle.myEncryptedShare ||
+                      !effectiveRecipientId
+                    }
+                    onClick={() => void handleForwardShare()}
+                    className="w-full"
+                  >
+                    <Send className="h-4 w-4" />
+                    {isUnlocking
+                      ? "Encrypting Share Locally..."
+                      : "Decrypt Locally & Forward Share"}
+                  </Button>
+                </div>
+
+                {/* Step D: Reconstruct AES key and decrypt locally */}
+                <div className="space-y-3 rounded-xl border border-navy-700/20 bg-navy-50/40 p-4">
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-sm font-semibold text-navy-950">
+                      2. Reconstruct &amp; Decrypt Locally
+                    </h4>
+                    <Badge
+                      variant={
+                        unlockBundle.forwardedSharesToMe.length >= 1
+                          ? "emerald"
+                          : "amber"
+                      }
+                    >
+                      {unlockBundle.forwardedSharesToMe.length} Forwarded to You
+                    </Badge>
+                  </div>
+                  <p className="text-xs leading-relaxed text-slate-600">
+                    Combines a forwarded share encrypted for you with your own
+                    share locally in browser memory using Shamir GF(256), then
+                    decrypts AES-256-GCM locally.
+                  </p>
+
+                  {unlockBundle.forwardedSharesToMe.length > 0 ? (
+                    <ul className="space-y-1 text-xs text-slate-700">
+                      {unlockBundle.forwardedSharesToMe.map((item) => {
+                        const senderName =
+                          members.find((m) => m.userId === item.senderMemberId)
+                            ?.fullName ?? item.senderMemberId;
+                        return (
+                          <li key={item.senderMemberId}>
+                            &bull; Encrypted share from{" "}
+                            <strong>{senderName}</strong>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  ) : (
+                    <p className="text-xs text-slate-500">
+                      Waiting for another committee officer to forward an
+                      encrypted share to you.
+                    </p>
+                  )}
+
+                  <Button
+                    type="button"
+                    variant="primary"
+                    disabled={
+                      isUnlocking ||
+                      localKeyStatus !== "ready" ||
+                      !unlockBundle.myEncryptedShare ||
+                      unlockBundle.forwardedSharesToMe.length === 0
+                    }
+                    onClick={() => void handleDecryptLocally()}
+                    className="w-full"
+                  >
+                    <LockOpen className="h-4 w-4" />
+                    {isUnlocking
+                      ? "Decrypting Locally..."
+                      : "Decrypt Complaint in Browser"}
+                  </Button>
+                </div>
+              </div>
+            ) : null}
 
             {unlockError ? (
-              <StatusNotice title="Unlock Failed" variant="warning">
+              <StatusNotice title="Local Unlock Notice" variant="warning">
                 {unlockError}
               </StatusNotice>
             ) : null}
 
             {unlockFeedback ? (
-              <StatusNotice title="Unlock Status" variant="success">
+              <StatusNotice title="C2 Zero-Knowledge Status" variant="success">
                 {unlockFeedback}
               </StatusNotice>
             ) : null}
@@ -777,7 +1280,7 @@ export function CommitteeDashboardClient({
             {decrypted && decrypted.complaintId === selectedComplaintId ? (
               <div className="space-y-3 rounded-xl border border-emerald-200 bg-emerald-50/40 p-4 text-sm text-slate-800">
                 <p className="font-semibold text-emerald-950">
-                  Decrypted Complaint Payload
+                  Decrypted Complaint Payload (Browser Memory Only)
                 </p>
                 <pre className="overflow-x-auto rounded-lg bg-white p-3 font-mono text-xs text-slate-800">
                   {JSON.stringify(decrypted.payload, null, 2)}

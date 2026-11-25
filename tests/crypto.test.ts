@@ -4,6 +4,10 @@ import test from "node:test";
 import {
   encryptComplaintInBrowser,
   encryptEvidenceBytesInBrowser,
+  forwardShareInBrowser,
+  importRsaOaepPrivateKeyNonExtractable,
+  reconstructAndDecryptComplaintInBrowser,
+  verifyPrivateKeyMatchesPublicKeyInBrowser,
 } from "../src/lib/security/client-crypto.ts";
 import {
   combineShares2OfN,
@@ -61,6 +65,89 @@ test("Shamir 2-of-3 secret sharing reconstructs exact 32-byte DEK from any pair"
   assert.throws(() => combineShares2OfN([shares[0], shares[0]]));
 });
 
+test("C2: Browser-side share forwarding and Member B local reconstruction & decryption", async () => {
+  const mA = makeMember("11111111-1111-1111-1111-111111111111");
+  const mB = makeMember("22222222-2222-2222-2222-222222222222");
+  const mC = makeMember("33333333-3333-3333-3333-333333333333");
+  const complaintId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+
+  const payload = {
+    detailedCategory: "Ragging / Hazing",
+    urgency: "immediate",
+    incidentDate: "2026-11-25",
+    location: "Block C Common Room",
+    description: "C2 zero-knowledge browser forwarding and local decryption test.",
+    additionalContext: "No plaintext or private keys leave browser",
+    evidenceFileNames: [],
+  };
+
+  const envelope = await encryptComplaintInBrowser({
+    complaintId,
+    payload,
+    recipients: [
+      { memberId: mA.id, publicKey: mA.publicKey },
+      { memberId: mB.id, publicKey: mB.publicKey },
+      { memberId: mC.id, publicKey: mC.publicKey },
+    ],
+  });
+
+  // Import non-extractable private keys in browser runtime
+  const keyA = await importRsaOaepPrivateKeyNonExtractable(mA.privateKey);
+  const keyB = await importRsaOaepPrivateKeyNonExtractable(mB.privateKey);
+  const keyC = await importRsaOaepPrivateKeyNonExtractable(mC.privateKey);
+
+  assert.equal(keyA.extractable, false);
+  assert.equal(
+    await verifyPrivateKeyMatchesPublicKeyInBrowser(keyA, mA.publicKey),
+    true
+  );
+  assert.equal(
+    await verifyPrivateKeyMatchesPublicKeyInBrowser(keyA, mB.publicKey),
+    false
+  );
+
+  // Member A unwraps A's share locally and re-encrypts it for Member B
+  const forwardedToB = await forwardShareInBrowser({
+    myEncryptedShareBase64: envelope.shares[mA.id],
+    myPrivateKey: keyA,
+    recipientPublicKeyPem: mB.publicKey,
+  });
+
+  // Member C (unintended recipient) CANNOT decrypt the share forwarded to Member B
+  await assert.rejects(() =>
+    reconstructAndDecryptComplaintInBrowser({
+      complaintId,
+      envelope,
+      myEncryptedShareBase64: envelope.shares[mC.id],
+      forwardedEncryptedSharesBase64: [forwardedToB],
+      myPrivateKey: keyC,
+    })
+  );
+
+  // Wrong private key (Member C's key against Member B's share) must fail safely
+  await assert.rejects(() =>
+    reconstructAndDecryptComplaintInBrowser({
+      complaintId,
+      envelope,
+      myEncryptedShareBase64: envelope.shares[mB.id],
+      forwardedEncryptedSharesBase64: [forwardedToB],
+      myPrivateKey: keyC,
+    })
+  );
+
+  // Member B decrypts forwarded share + B's own share locally, reconstructs AES-256 key, and decrypts
+  const result = await reconstructAndDecryptComplaintInBrowser<typeof payload>({
+    complaintId,
+    envelope,
+    myEncryptedShareBase64: envelope.shares[mB.id],
+    forwardedEncryptedSharesBase64: [forwardedToB],
+    myPrivateKey: keyB,
+  });
+
+  assert.equal(result.reconstructedKeyHexLength, 64); // 256-bit key
+  assert.deepEqual(result.payload, payload);
+});
+
 test("Browser WebCrypto complaint encryption validates and decrypts cleanly with server unlock", async () => {
   const m1 = makeMember("11111111-1111-1111-1111-111111111111");
   const m2 = makeMember("22222222-2222-2222-2222-222222222222");
@@ -111,7 +198,6 @@ test("Browser WebCrypto complaint encryption validates and decrypts cleanly with
   );
   assert.deepEqual(decrypted, payload);
 
-  // Wrong AAD must reject decryption
   assert.throws(() =>
     decryptComplaintEnvelope(envelope, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", [
       s1,

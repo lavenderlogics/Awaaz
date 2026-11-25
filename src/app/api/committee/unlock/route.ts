@@ -3,71 +3,94 @@ import { NextResponse } from "next/server";
 import { appendAuditLog } from "@/lib/security/audit";
 import { requireCommitteeMember } from "@/lib/security/committee-auth";
 import {
-  decryptComplaintEnvelope,
   type EncryptedComplaintEnvelope,
-  protectStoredShare,
-  REQUIRED_UNLOCK_APPROVALS,
-  unprotectStoredShare,
-  unwrapMemberShareWithPrivateKey,
+  isStrictRsa2048CiphertextBase64,
+  isValidRsaPublicKeyPem,
 } from "@/lib/security/crypto";
 import { checkRateLimit, getRateLimitClientKey } from "@/lib/security/rate-limit";
 import { isUuid } from "@/lib/security/validation";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { getShareWrappingSecret } from "@/lib/supabase/config";
+
+interface ForwardedShareEnvelope {
+  version: 2;
+  scheme: "C2-FORWARDED-RSA-OAEP-256";
+  complaintId: string;
+  senderMemberId: string;
+  recipients: Record<string, string>;
+}
+
+const FORBIDDEN_SECRET_FIELDS = [
+  "privateKeyPem",
+  "privateKey",
+  "plaintextShare",
+  "rawShare",
+  "aesKey",
+  "rawDek",
+  "decryptedPayload",
+] as const;
+
+function parseForwardedShareEnvelope(
+  raw: string
+): ForwardedShareEnvelope | null {
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (
+      parsed &&
+      parsed.version === 2 &&
+      parsed.scheme === "C2-FORWARDED-RSA-OAEP-256" &&
+      parsed.recipients &&
+      typeof parsed.recipients === "object" &&
+      !Array.isArray(parsed.recipients)
+    ) {
+      return parsed as unknown as ForwardedShareEnvelope;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 /**
- * Dual-key complaint unlock endpoint:
- * Each active committee member submits their own private key in memory to unwrap
- * their RSA-encrypted Shamir share and record an approval in `unlock_approvals`.
- * Once >= 2 distinct active members approve, the AES-256-GCM payload is decrypted.
+ * C2 Step A & Step D retrieval endpoint:
+ * Returns ONLY the encrypted complaint ciphertext, the authenticated member's own
+ * wrapped share, and forwarded encrypted shares specifically addressed to this member.
+ * Never returns private keys, plaintext shares, AES keys, or other members' shares.
  */
-export async function POST(request: Request) {
-  const rate = checkRateLimit(
-    getRateLimitClientKey(request.headers, "committee-unlock"),
-    { limit: 20, windowMs: 10 * 60_000 }
-  );
-
-  if (!rate.allowed) {
-    return NextResponse.json(
-      { error: "Too many unlock requests. Please try again later." },
-      { status: 429 }
-    );
-  }
-
+export async function GET(request: Request) {
   const auth = await requireCommitteeMember();
   if (!auth.ok) {
     return auth.response;
   }
 
-  let body: { complaintId?: unknown; privateKeyPem?: unknown };
-  try {
-    body = (await request.json()) as {
-      complaintId?: unknown;
-      privateKeyPem?: unknown;
-    };
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
-  }
-
-  if (!isUuid(body.complaintId)) {
+  const url = new URL(request.url);
+  const complaintId = url.searchParams.get("complaintId")?.trim() ?? "";
+  if (!isUuid(complaintId)) {
     return NextResponse.json(
-      { error: "Valid complaintId UUID is required." },
+      { error: "Valid complaintId UUID query parameter is required." },
       { status: 400 }
     );
   }
 
-  const complaintId = (body.complaintId as string).trim();
-  const privateKeyPem =
-    typeof body.privateKeyPem === "string" ? body.privateKeyPem.trim() : "";
-
   const admin = createAdminClient();
-  const { data: complaint, error: complaintError } = await admin
-    .from("complaints")
-    .select("id, category, status, encrypted_payload, created_at, updated_at")
-    .eq("id", complaintId)
-    .maybeSingle();
+  const [complaintRes, approvalsRes, evidenceRes] = await Promise.all([
+    admin
+      .from("complaints")
+      .select(
+        "id, category, status, encrypted_payload, encryption_algorithm, created_at, updated_at"
+      )
+      .eq("id", complaintId)
+      .maybeSingle(),
+    admin
+      .from("unlock_approvals")
+      .select("member_id, encrypted_key_share, approved_at")
+      .eq("complaint_id", complaintId),
+    admin
+      .from("evidence_files")
+      .select("id, mime_type, file_size, file_hash, created_at")
+      .eq("complaint_id", complaintId),
+  ]);
 
-  if (complaintError || !complaint) {
+  if (complaintRes.error || !complaintRes.data) {
     return NextResponse.json(
       { error: "Complaint not found." },
       { status: 404 }
@@ -77,7 +100,7 @@ export async function POST(request: Request) {
   let envelope: EncryptedComplaintEnvelope;
   try {
     envelope = JSON.parse(
-      complaint.encrypted_payload
+      complaintRes.data.encrypted_payload
     ) as EncryptedComplaintEnvelope;
   } catch {
     return NextResponse.json(
@@ -86,165 +109,263 @@ export async function POST(request: Request) {
     );
   }
 
-  const shareWrappingSecret = getShareWrappingSecret();
+  const myEncryptedShare = envelope.shares?.[auth.member.user_id] ?? null;
+  const forwardedSharesToMe: Array<{
+    senderMemberId: string;
+    ciphertextShare: string;
+    approvedAt: string | null;
+  }> = [];
+  const approvalSummaries: Array<{
+    memberId: string;
+    approvedAt: string | null;
+    forwardedToIds: string[];
+  }> = [];
 
-  if (privateKeyPem) {
-    const memberEncryptedShare = envelope.shares?.[auth.member.user_id];
-    if (!memberEncryptedShare) {
-      return NextResponse.json(
-        {
-          error:
-            "This complaint does not contain a key share for your committee account.",
-        },
-        { status: 403 }
-      );
+  for (const row of approvalsRes.data ?? []) {
+    const parsed = parseForwardedShareEnvelope(row.encrypted_key_share);
+    if (!parsed) {
+      approvalSummaries.push({
+        memberId: row.member_id,
+        approvedAt: row.approved_at,
+        forwardedToIds: [],
+      });
+      continue;
     }
 
-    let rawShare: Buffer;
-    try {
-      rawShare = unwrapMemberShareWithPrivateKey(
-        memberEncryptedShare,
-        privateKeyPem
-      );
-    } catch {
-      return NextResponse.json(
-        { error: "Invalid private key for this committee account." },
-        { status: 400 }
-      );
-    }
+    const recipientIds = Object.keys(parsed.recipients);
+    approvalSummaries.push({
+      memberId: row.member_id,
+      approvedAt: row.approved_at,
+      forwardedToIds: recipientIds,
+    });
 
-    const protectedShare = protectStoredShare(
-      rawShare,
-      complaintId,
-      auth.member.user_id,
-      shareWrappingSecret
-    );
-    rawShare.fill(0);
-
-    const { data: existingApproval } = await admin
-      .from("unlock_approvals")
-      .select("id")
-      .eq("complaint_id", complaintId)
-      .eq("member_id", auth.member.user_id)
-      .maybeSingle();
-
-    if (!existingApproval) {
-      const { error: insertApprovalError } = await admin
-        .from("unlock_approvals")
-        .insert({
-          id: crypto.randomUUID(),
-          complaint_id: complaintId,
-          member_id: auth.member.user_id,
-          encrypted_key_share: protectedShare,
-          approved_at: new Date().toISOString(),
-        });
-
-      if (insertApprovalError) {
-        return NextResponse.json(
-          { error: `Failed to record unlock approval: ${insertApprovalError.message}` },
-          { status: 500 }
-        );
-      }
-
-      await appendAuditLog(admin, {
-        complaintId,
-        actorMemberId: auth.member.user_id,
-        eventType: "UNLOCK_APPROVED",
-        eventDetails: {
-          memberRole: auth.member.role,
-        },
+    // Strictly return only forwarded shares addressed to the authenticated member
+    const shareForMe = parsed.recipients[auth.member.user_id];
+    if (
+      row.member_id !== auth.member.user_id &&
+      isStrictRsa2048CiphertextBase64(shareForMe)
+    ) {
+      forwardedSharesToMe.push({
+        senderMemberId: row.member_id,
+        ciphertextShare: shareForMe,
+        approvedAt: row.approved_at,
       });
     }
   }
 
-  const { data: approvals, error: approvalsError } = await admin
-    .from("unlock_approvals")
-    .select("member_id, encrypted_key_share, approved_at")
-    .eq("complaint_id", complaintId);
+  return NextResponse.json(
+    {
+      complaintId: complaintRes.data.id,
+      category: complaintRes.data.category,
+      status: complaintRes.data.status ?? "submitted",
+      encryptionAlgorithm:
+        complaintRes.data.encryption_algorithm ?? "AES-256-GCM",
+      createdAt: complaintRes.data.created_at,
+      updatedAt: complaintRes.data.updated_at,
+      envelope: {
+        version: envelope.version,
+        algorithm: envelope.algorithm,
+        keyScheme: envelope.keyScheme,
+        iv: envelope.iv,
+        authTag: envelope.authTag,
+        ciphertext: envelope.ciphertext,
+      },
+      myEncryptedShare,
+      forwardedSharesToMe,
+      approvalSummaries,
+      evidenceFiles: evidenceRes.data ?? [],
+    },
+    { headers: { "Cache-Control": "no-store" } }
+  );
+}
 
-  if (approvalsError) {
+/**
+ * C2 Step C share-forwarding endpoint:
+ * Accepts ONLY a browser-encrypted forwarded share wrapped with the intended
+ * recipient committee member's RSA-OAEP public key. Never accepts private keys
+ * or plaintext shares, and never decrypts anything on the server.
+ */
+export async function POST(request: Request) {
+  const rate = checkRateLimit(
+    getRateLimitClientKey(request.headers, "committee-share-forward"),
+    { limit: 30, windowMs: 10 * 60_000 }
+  );
+
+  if (!rate.allowed) {
     return NextResponse.json(
-      { error: approvalsError.message },
-      { status: 500 }
+      { error: "Too many share forwarding requests. Please try again later." },
+      { status: 429 }
     );
   }
 
-  const uniqueApprovals = new Map<string, string>();
-  for (const row of approvals ?? []) {
-    if (!uniqueApprovals.has(row.member_id)) {
-      uniqueApprovals.set(row.member_id, row.encrypted_key_share);
-    }
+  const auth = await requireCommitteeMember();
+  if (!auth.ok) {
+    return auth.response;
   }
 
-  if (uniqueApprovals.size < REQUIRED_UNLOCK_APPROVALS) {
-    return NextResponse.json({
-      unlocked: false,
-      approvalsCount: uniqueApprovals.size,
-      requiredApprovals: REQUIRED_UNLOCK_APPROVALS,
-    });
-  }
-
-  const unwrappedShares: Buffer[] = [];
-  for (const [memberId, protectedJson] of uniqueApprovals.entries()) {
-    try {
-      unwrappedShares.push(
-        unprotectStoredShare(
-          protectedJson,
-          complaintId,
-          memberId,
-          shareWrappingSecret
-        )
-      );
-    } catch {
-      continue;
-    }
-    if (unwrappedShares.length === REQUIRED_UNLOCK_APPROVALS) {
-      break;
-    }
-  }
-
-  if (unwrappedShares.length < REQUIRED_UNLOCK_APPROVALS) {
-    return NextResponse.json(
-      { error: "Unable to unwrap enough valid key shares to decrypt complaint." },
-      { status: 500 }
-    );
-  }
-
-  let decryptedPayload: Record<string, unknown>;
+  let body: Record<string, unknown>;
   try {
-    decryptedPayload = decryptComplaintEnvelope(
-      envelope,
-      complaintId,
-      unwrappedShares
+    body = (await request.json()) as Record<string, unknown>;
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+  }
+
+  const forbidden = FORBIDDEN_SECRET_FIELDS.filter(
+    (field) => body[field] !== undefined
+  );
+  if (forbidden.length > 0) {
+    return NextResponse.json(
+      {
+        error:
+          "Private keys, plaintext shares, and AES keys must never be sent to the server.",
+      },
+      { status: 400 }
     );
+  }
+
+  if (!isUuid(body.complaintId) || !isUuid(body.recipientMemberId)) {
+    return NextResponse.json(
+      { error: "Valid complaintId and recipientMemberId UUIDs are required." },
+      { status: 400 }
+    );
+  }
+
+  const complaintId = (body.complaintId as string).trim();
+  const recipientMemberId = (body.recipientMemberId as string).trim();
+
+  if (recipientMemberId === auth.member.user_id) {
+    return NextResponse.json(
+      { error: "You cannot forward your own share to yourself." },
+      { status: 400 }
+    );
+  }
+
+  if (!isStrictRsa2048CiphertextBase64(body.encryptedForwardedShare)) {
+    return NextResponse.json(
+      {
+        error:
+          "encryptedForwardedShare must be valid RSA-OAEP-2048 ciphertext (base64).",
+      },
+      { status: 400 }
+    );
+  }
+  const encryptedForwardedShare = body.encryptedForwardedShare.trim();
+
+  const admin = createAdminClient();
+  const [complaintRes, recipientRes, existingApprovalRes] = await Promise.all([
+    admin
+      .from("complaints")
+      .select("id, encrypted_payload")
+      .eq("id", complaintId)
+      .maybeSingle(),
+    admin
+      .from("committee_members")
+      .select("user_id, public_key, is_active")
+      .eq("user_id", recipientMemberId)
+      .maybeSingle(),
+    admin
+      .from("unlock_approvals")
+      .select("id, encrypted_key_share")
+      .eq("complaint_id", complaintId)
+      .eq("member_id", auth.member.user_id)
+      .maybeSingle(),
+  ]);
+
+  if (complaintRes.error || !complaintRes.data) {
+    return NextResponse.json(
+      { error: "Complaint not found." },
+      { status: 404 }
+    );
+  }
+
+  if (
+    recipientRes.error ||
+    !recipientRes.data ||
+    recipientRes.data.is_active === false ||
+    !recipientRes.data.public_key ||
+    !isValidRsaPublicKeyPem(recipientRes.data.public_key)
+  ) {
+    return NextResponse.json(
+      {
+        error:
+          "Recipient must be an active committee member with a valid RSA public key.",
+      },
+      { status: 403 }
+    );
+  }
+
+  let envelope: EncryptedComplaintEnvelope;
+  try {
+    envelope = JSON.parse(
+      complaintRes.data.encrypted_payload
+    ) as EncryptedComplaintEnvelope;
   } catch {
     return NextResponse.json(
-      { error: "AES-256-GCM authentication or decryption failed." },
+      { error: "Stored complaint envelope is malformed." },
       { status: 500 }
     );
-  } finally {
-    unwrappedShares.forEach((b) => b.fill(0));
   }
 
-  const { data: evidenceRows } = await admin
-    .from("evidence_files")
-    .select("id, mime_type, file_size, file_hash, created_at")
-    .eq("complaint_id", complaintId);
+  if (!envelope.shares?.[auth.member.user_id]) {
+    return NextResponse.json(
+      {
+        error:
+          "This complaint does not contain an encrypted share for your committee account.",
+      },
+      { status: 403 }
+    );
+  }
+
+  const existingParsed = existingApprovalRes.data
+    ? parseForwardedShareEnvelope(existingApprovalRes.data.encrypted_key_share)
+    : null;
+
+  const updatedEnvelope: ForwardedShareEnvelope = {
+    version: 2,
+    scheme: "C2-FORWARDED-RSA-OAEP-256",
+    complaintId,
+    senderMemberId: auth.member.user_id,
+    recipients: {
+      ...(existingParsed?.recipients ?? {}),
+      [recipientMemberId]: encryptedForwardedShare,
+    },
+  };
+
+  const nowIso = new Date().toISOString();
+  const { error: upsertError } = await admin.from("unlock_approvals").upsert(
+    {
+      id: existingApprovalRes.data?.id ?? crypto.randomUUID(),
+      complaint_id: complaintId,
+      member_id: auth.member.user_id,
+      encrypted_key_share: JSON.stringify(updatedEnvelope),
+      approved_at: nowIso,
+    },
+    { onConflict: "complaint_id,member_id" }
+  );
+
+  if (upsertError) {
+    return NextResponse.json(
+      { error: `Failed to store forwarded share: ${upsertError.message}` },
+      { status: 500 }
+    );
+  }
 
   await appendAuditLog(admin, {
     complaintId,
     actorMemberId: auth.member.user_id,
-    eventType: "COMPLAINT_DECRYPTED",
+    eventType: "UNLOCK_APPROVED",
     eventDetails: {
-      approvalsCount: uniqueApprovals.size,
+      mode: "C2-client-forwarded",
+      recipientMemberId,
+      memberRole: auth.member.role,
     },
   });
 
   return NextResponse.json({
-    unlocked: true,
-    approvalsCount: uniqueApprovals.size,
-    requiredApprovals: REQUIRED_UNLOCK_APPROVALS,
-    payload: decryptedPayload,
-    evidenceFiles: evidenceRows ?? [],
+    ok: true,
+    complaintId,
+    senderMemberId: auth.member.user_id,
+    recipientMemberId,
+    approvedAt: nowIso,
   });
 }
