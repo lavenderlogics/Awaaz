@@ -9,8 +9,12 @@ import { FormField, Input } from "@/components/ui/FormField";
 import { StatusNotice } from "@/components/ui/StatusNotice";
 import { createClient } from "@/lib/supabase/client";
 
+interface CommitteeLoginFormProps {
+  isConfigured: boolean;
+}
+
 /** Committee sign-in form wired to Supabase Auth. */
-export function CommitteeLoginForm() {
+export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -20,8 +24,15 @@ export function CommitteeLoginForm() {
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const trimmedEmail = email.trim();
 
+    if (!isConfigured) {
+      setError(
+        "Supabase environment variables are not configured in this deployment."
+      );
+      return;
+    }
+
+    const trimmedEmail = email.trim();
     if (!trimmedEmail || !password) {
       setError("Please enter both an institutional email and password.");
       return;
@@ -77,7 +88,7 @@ export function CommitteeLoginForm() {
               placeholder="committee@college.edu"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              disabled={isSubmitting}
+              disabled={isSubmitting || !isConfigured}
             />
           </FormField>
 
@@ -91,7 +102,7 @@ export function CommitteeLoginForm() {
                 className="pr-10"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                disabled={isSubmitting}
+                disabled={isSubmitting || !isConfigured}
               />
               <button
                 type="button"
@@ -120,7 +131,7 @@ export function CommitteeLoginForm() {
               variant="primary"
               size="lg"
               className="w-full"
-              disabled={isSubmitting}
+              disabled={isSubmitting || !isConfigured}
             >
               {isSubmitting ? "Signing In..." : "Sign In"}
             </Button>

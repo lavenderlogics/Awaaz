@@ -31,6 +31,7 @@ export interface CommitteeComplaintRow {
 }
 
 interface CommitteeDashboardClientProps {
+  isConfigured: boolean;
   userEmail: string | null;
   complaints: CommitteeComplaintRow[];
   queryError: string | null;
@@ -45,6 +46,7 @@ const SUMMARY_METRICS = [
 
 /** Committee dashboard workspace connected to Supabase Auth and live query results. */
 export function CommitteeDashboardClient({
+  isConfigured,
   userEmail,
   complaints,
   queryError,
@@ -93,6 +95,7 @@ export function CommitteeDashboardClient({
   }, [complaints, userEmail]);
 
   const handleSignOut = async () => {
+    if (!isConfigured) return;
     setIsSigningOut(true);
     try {
       const supabase = createClient();
@@ -106,7 +109,17 @@ export function CommitteeDashboardClient({
 
   return (
     <div className="space-y-8">
-      {userEmail ? (
+      {!isConfigured ? (
+        <StatusNotice
+          title="Missing Supabase Environment Variables on Server"
+          variant="warning"
+        >
+          Add <code className="font-mono">NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
+          <code className="font-mono">NEXT_PUBLIC_SUPABASE_ANON_KEY</code> in
+          your deployment environment settings (e.g., Vercel Project Settings
+          &rarr; Environment Variables) and redeploy.
+        </StatusNotice>
+      ) : userEmail ? (
         <StatusNotice title="Connected as Committee Officer" variant="navy">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <span>
@@ -125,7 +138,10 @@ export function CommitteeDashboardClient({
           </div>
         </StatusNotice>
       ) : (
-        <StatusNotice title="Committee Sign-In Required for Live Records" variant="warning">
+        <StatusNotice
+          title="Committee Sign-In Required for Live Records"
+          variant="warning"
+        >
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <span>
               Supabase is connected, and Row-Level Security blocks anonymous
@@ -158,7 +174,9 @@ export function CommitteeDashboardClient({
                   {value === null ? "\u2014" : value}
                 </p>
                 <p className="mt-1 text-xs text-slate-500">
-                  {userEmail ? "Live Supabase count" : "Requires committee session"}
+                  {userEmail
+                    ? "Live Supabase count"
+                    : "Requires committee session"}
                 </p>
               </CardContent>
             </Card>
