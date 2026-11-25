@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowRight, Eye, EyeOff, Lock, Mail, UserPlus } from "lucide-react";
+import { ArrowRight, Eye, EyeOff, KeyRound, Lock, Mail, UserPlus } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { type FormEvent, useState } from "react";
 import { Button, LinkButton } from "@/components/ui/Button";
@@ -9,13 +9,21 @@ import { FormField, Input } from "@/components/ui/FormField";
 import { StatusNotice } from "@/components/ui/StatusNotice";
 import { createClient } from "@/lib/supabase/client";
 
-type AuthMode = "signin" | "signup";
+type AuthMode = "signin" | "signup" | "reset";
 
 interface CommitteeLoginFormProps {
   isConfigured: boolean;
 }
 
-/** Committee authentication card supporting Sign In and Sign Up with email verification. */
+function formatSupabaseAuthError(message: string): string {
+  const normalized = message.toLowerCase();
+  if (normalized.includes("rate limit")) {
+    return "Email sending rate limit exceeded on Supabase's built-in mailer. Wait about an hour before requesting another email, or ask the project admin to connect Custom SMTP / confirm the account in Supabase Auth.";
+  }
+  return message;
+}
+
+/** Committee authentication card supporting Sign In, Sign Up, and Password Reset. */
 export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
   const router = useRouter();
   const [mode, setMode] = useState<AuthMode>("signin");
@@ -30,6 +38,7 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
   const [verificationSentTo, setVerificationSentTo] = useState<string | null>(
     null
   );
+  const [resetSentTo, setResetSentTo] = useState<string | null>(null);
   const [resendMessage, setResendMessage] = useState("");
 
   const switchMode = (nextMode: AuthMode) => {
@@ -37,10 +46,11 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
     setError("");
     setResendMessage("");
     setVerificationSentTo(null);
+    setResetSentTo(null);
   };
 
-  const getCallbackUrl = () =>
-    `${window.location.origin}/auth/callback?next=/committee/dashboard`;
+  const getCallbackUrl = (nextPath = "/committee/dashboard") =>
+    `${window.location.origin}/auth/callback?next=${encodeURIComponent(nextPath)}`;
 
   const handleResendVerification = async (targetEmail: string) => {
     if (!isConfigured || !targetEmail.trim()) return;
@@ -59,7 +69,7 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
       });
 
       if (resendError) {
-        setError(resendError.message);
+        setError(formatSupabaseAuthError(resendError.message));
         return;
       }
 
@@ -86,7 +96,12 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
     }
 
     const trimmedEmail = email.trim();
-    if (!trimmedEmail || !password) {
+    if (!trimmedEmail) {
+      setError("Please enter your institutional email.");
+      return;
+    }
+
+    if (mode !== "reset" && !password) {
       setError("Please enter both an institutional email and password.");
       return;
     }
@@ -94,6 +109,7 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
     setError("");
     setResendMessage("");
     setVerificationSentTo(null);
+    setResetSentTo(null);
 
     if (mode === "signup") {
       if (!fullName.trim()) {
@@ -115,6 +131,23 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
     try {
       const supabase = createClient();
 
+      if (mode === "reset") {
+        const { error: resetError } = await supabase.auth.resetPasswordForEmail(
+          trimmedEmail,
+          {
+            redirectTo: getCallbackUrl("/committee/reset-password"),
+          }
+        );
+
+        if (resetError) {
+          setError(formatSupabaseAuthError(resetError.message));
+          return;
+        }
+
+        setResetSentTo(trimmedEmail);
+        return;
+      }
+
       if (mode === "signin") {
         const { error: authError } = await supabase.auth.signInWithPassword({
           email: trimmedEmail,
@@ -122,7 +155,7 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
         });
 
         if (authError) {
-          setError(authError.message);
+          setError(formatSupabaseAuthError(authError.message));
           return;
         }
 
@@ -135,7 +168,7 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
         email: trimmedEmail,
         password,
         options: {
-          emailRedirectTo: getCallbackUrl(),
+          emailRedirectTo: getCallbackUrl("/committee/dashboard"),
           data: {
             full_name: fullName.trim(),
           },
@@ -143,7 +176,7 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
       });
 
       if (signUpError) {
-        setError(signUpError.message);
+        setError(formatSupabaseAuthError(signUpError.message));
         return;
       }
 
@@ -188,8 +221,10 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
           <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-navy-900 text-white">
             {mode === "signin" ? (
               <Lock className="h-5 w-5" />
-            ) : (
+            ) : mode === "signup" ? (
               <UserPlus className="h-5 w-5" />
+            ) : (
+              <KeyRound className="h-5 w-5" />
             )}
           </div>
 
@@ -230,12 +265,16 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
         <CardTitle>
           {mode === "signin"
             ? "Committee Member Sign In"
-            : "Create Committee Account"}
+            : mode === "signup"
+              ? "Create Committee Account"
+              : "Reset Committee Password"}
         </CardTitle>
         <p className="mt-1 text-sm text-slate-600">
           {mode === "signin"
             ? "Restricted access for Anti-Ragging & Internal Complaints Committee officers."
-            : "Register with your institutional email. A verification link will be sent to your inbox."}
+            : mode === "signup"
+              ? "Register with your institutional email. A verification link will be sent to your inbox."
+              : "Enter your registered email to receive a password reset link."}
         </p>
       </CardHeader>
 
@@ -267,39 +306,53 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
             />
           </FormField>
 
-          <FormField
-            id="committeePassword"
-            label="Password"
-            hint={mode === "signup" ? "Minimum 8 characters." : undefined}
-            required
-          >
-            <div className="relative">
-              <Input
-                id="committeePassword"
-                type={showPassword ? "text" : "password"}
-                autoComplete={
-                  mode === "signin" ? "current-password" : "new-password"
-                }
-                placeholder="Enter password"
-                className="pr-10"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                disabled={isSubmitting || !isConfigured}
-              />
+          {mode !== "reset" ? (
+            <FormField
+              id="committeePassword"
+              label="Password"
+              hint={mode === "signup" ? "Minimum 8 characters." : undefined}
+              required
+            >
+              <div className="relative">
+                <Input
+                  id="committeePassword"
+                  type={showPassword ? "text" : "password"}
+                  autoComplete={
+                    mode === "signin" ? "current-password" : "new-password"
+                  }
+                  placeholder="Enter password"
+                  className="pr-10"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  disabled={isSubmitting || !isConfigured}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((prev) => !prev)}
+                  className="absolute inset-y-0 right-0 flex items-center px-3 text-slate-500 hover:text-navy-900"
+                  aria-label={showPassword ? "Hide password" : "Show password"}
+                >
+                  {showPassword ? (
+                    <EyeOff className="h-4 w-4" />
+                  ) : (
+                    <Eye className="h-4 w-4" />
+                  )}
+                </button>
+              </div>
+            </FormField>
+          ) : null}
+
+          {mode === "signin" ? (
+            <div className="-mt-2 flex justify-end">
               <button
                 type="button"
-                onClick={() => setShowPassword((prev) => !prev)}
-                className="absolute inset-y-0 right-0 flex items-center px-3 text-slate-500 hover:text-navy-900"
-                aria-label={showPassword ? "Hide password" : "Show password"}
+                onClick={() => switchMode("reset")}
+                className="text-xs font-medium text-navy-700 hover:text-navy-950 hover:underline"
               >
-                {showPassword ? (
-                  <EyeOff className="h-4 w-4" />
-                ) : (
-                  <Eye className="h-4 w-4" />
-                )}
+                Forgot password?
               </button>
             </div>
-          </FormField>
+          ) : null}
 
           {mode === "signup" ? (
             <FormField
@@ -342,6 +395,13 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
             </StatusNotice>
           ) : null}
 
+          {resetSentTo ? (
+            <StatusNotice title="Password Reset Email Sent" variant="success">
+              If an account exists for <strong>{resetSentTo}</strong>, a
+              password recovery link has been sent to that inbox.
+            </StatusNotice>
+          ) : null}
+
           {resendMessage ? (
             <StatusNotice title="Email Resent" variant="info">
               {resendMessage}
@@ -350,7 +410,13 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
 
           {error ? (
             <StatusNotice
-              title={mode === "signin" ? "Sign-In Failed" : "Sign-Up Failed"}
+              title={
+                mode === "signin"
+                  ? "Sign-In Failed"
+                  : mode === "signup"
+                    ? "Sign-Up Failed"
+                    : "Reset Request Failed"
+              }
               variant="warning"
             >
               <p>{error}</p>
@@ -382,20 +448,37 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
               {isSubmitting
                 ? mode === "signin"
                   ? "Signing In..."
-                  : "Creating Account..."
+                  : mode === "signup"
+                    ? "Creating Account..."
+                    : "Sending Reset Link..."
                 : mode === "signin"
                   ? "Sign In"
-                  : "Create Account & Send Verification"}
+                  : mode === "signup"
+                    ? "Create Account & Send Verification"
+                    : "Send Password Reset Link"}
             </Button>
-            <LinkButton
-              href="/committee/dashboard"
-              variant="outline"
-              size="md"
-              className="w-full"
-            >
-              View Dashboard Workspace
-              <ArrowRight className="h-4 w-4" />
-            </LinkButton>
+
+            {mode === "reset" ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="md"
+                className="w-full"
+                onClick={() => switchMode("signin")}
+              >
+                Back to Sign In
+              </Button>
+            ) : (
+              <LinkButton
+                href="/committee/dashboard"
+                variant="outline"
+                size="md"
+                className="w-full"
+              >
+                View Dashboard Workspace
+                <ArrowRight className="h-4 w-4" />
+              </LinkButton>
+            )}
           </div>
         </form>
       </CardContent>
