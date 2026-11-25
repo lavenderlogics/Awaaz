@@ -10,10 +10,17 @@ import { createClient } from "@/lib/supabase/server";
 export const metadata: Metadata = {
   title: "Committee Login",
   description:
-    "Sign-in portal for authorized campus anti-ragging and harassment committee members.",
+    "Sign-in and registration portal for campus anti-ragging and harassment committee members.",
 };
 
-export default async function CommitteeLoginPage() {
+interface CommitteeLoginPageProps {
+  searchParams: Promise<{ error?: string }>;
+}
+
+export default async function CommitteeLoginPage({
+  searchParams,
+}: CommitteeLoginPageProps) {
+  const { error: callbackError } = await searchParams;
   const configured = isSupabaseConfigured();
   let userEmail: string | null = null;
 
@@ -33,15 +40,21 @@ export default async function CommitteeLoginPage() {
     <div>
       <PageHeader
         eyebrow="Authorized Access"
-        title="Committee Portal Sign In"
-        description="Dedicated access point for institutional anti-ragging and internal complaints committee members."
+        title="Committee Portal Access"
+        description="Sign in or create an account with your email. New registrations require email verification before dashboard access."
         badgeText={
           configured ? "Supabase Auth Connected" : "Supabase Env Required"
         }
       />
 
       <section className="mx-auto max-w-4xl px-4 py-12 sm:px-6 sm:py-16 lg:px-8">
-        <div className="mb-8">
+        <div className="mb-8 space-y-4">
+          {callbackError ? (
+            <StatusNotice title="Email Verification Issue" variant="warning">
+              {callbackError}
+            </StatusNotice>
+          ) : null}
+
           {!configured ? (
             <StatusNotice
               title="Missing Supabase Environment Variables on Server"
@@ -51,7 +64,7 @@ export default async function CommitteeLoginPage() {
               and <code className="font-mono">NEXT_PUBLIC_SUPABASE_ANON_KEY</code>{" "}
               in your deployment environment settings (for example, Vercel
               Project Settings &rarr; Environment Variables) and redeploy to
-              enable committee sign-in.
+              enable committee sign-in and sign-up.
             </StatusNotice>
           ) : userEmail ? (
             <StatusNotice title="Active Committee Session Detected" variant="navy">
@@ -65,9 +78,10 @@ export default async function CommitteeLoginPage() {
               </div>
             </StatusNotice>
           ) : (
-            <StatusNotice title="Supabase Auth Connected" variant="info">
-              Sign in with a committee account provisioned in your Supabase
-              project&apos;s Authentication users.
+            <StatusNotice title="Supabase Email Verification Active" variant="info">
+              Use <strong>Sign Up</strong> to register with your email and
+              receive an authentication verification link, or{" "}
+              <strong>Sign In</strong> if your email is already verified.
             </StatusNotice>
           )}
         </div>

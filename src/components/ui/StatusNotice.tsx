@@ -1,7 +1,7 @@
-import { AlertTriangle, Info, ShieldAlert } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Info, ShieldAlert } from "lucide-react";
 import type { ReactNode } from "react";
 
-type NoticeVariant = "info" | "warning" | "navy";
+type NoticeVariant = "info" | "warning" | "navy" | "success";
 
 interface StatusNoticeProps {
   title: string;
@@ -30,9 +30,14 @@ const NOTICE_STYLES: Record<
     iconColor: "text-navy-800",
     titleColor: "text-navy-950",
   },
+  success: {
+    container: "border-emerald-200 bg-emerald-50/80 text-emerald-900",
+    iconColor: "text-emerald-700",
+    titleColor: "text-emerald-950",
+  },
 };
 
-/** Honest system/integration callout banner for UI setup and safety notices. */
+/** Honest system/integration callout banner for UI setup and status notices. */
 export function StatusNotice({
   title,
   children,
@@ -45,14 +50,16 @@ export function StatusNotice({
       ? AlertTriangle
       : variant === "navy"
         ? ShieldAlert
-        : Info;
+        : variant === "success"
+          ? CheckCircle2
+          : Info;
 
   return (
     <div
       className={`flex gap-3.5 rounded-xl border p-4 text-sm leading-relaxed ${styles.container} ${className}`}
     >
       <Icon className={`mt-0.5 h-5 w-5 shrink-0 ${styles.iconColor}`} />
-      <div className="space-y-1">
+      <div className="w-full space-y-1">
         <p className={`font-semibold ${styles.titleColor}`}>{title}</p>
         <div>{children}</div>
       </div>
