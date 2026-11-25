@@ -18,19 +18,19 @@ export default function ReportPage() {
         eyebrow="Anonymous Intake"
         title="Submit a Campus Incident Report"
         description="Use this structured form to document ragging, intimidation, or harassment without entering your personal identity."
-        badgeText="UI Setup · Backend Pending"
+        badgeText="AES-256-GCM Encrypted Intake"
       />
 
       <section className="mx-auto max-w-6xl px-4 py-10 sm:px-6 sm:py-14 lg:px-8">
         <div className="mb-8">
           <StatusNotice
-            title="Initial Setup Notice — No Live Storage Connected"
+            title="Zero Plaintext Storage &amp; Dual-Key Protection"
             variant="info"
           >
-            This form demonstrates the intake layout and client-side field
-            validation. Supabase database storage and transport/storage security
-            controls are not connected yet, and no encryption is claimed in this
-            initial scaffold.
+            Sensitive complaint details and attached evidence files are
+            encrypted with <strong>AES-256-GCM</strong> before storage, and
+            decryption keys are split across authorized committee members so no
+            single account can read reports alone.
           </StatusNotice>
         </div>
 
@@ -63,10 +63,10 @@ export default function ReportPage() {
                 </p>
                 <p>
                   <strong className="text-slate-900">
-                    3. Save your Case ID:
+                    3. Save your Case ID &amp; Secret:
                   </strong>{" "}
-                  Once backend persistence is active, a reference ID will let
-                  you check updates anonymously.
+                  Your Case ID tracks committee progress, and your Recovery
+                  Secret authorizes follow-up encrypted evidence uploads.
                 </p>
               </CardContent>
             </Card>

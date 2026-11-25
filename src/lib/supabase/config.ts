@@ -67,3 +67,23 @@ export function isServiceRoleConfigured(): boolean {
 
   return Boolean(url && serviceRoleKey);
 }
+
+/** Returns a server-only secret for wrapping intermediate unlock shares. */
+export function getShareWrappingSecret(): string {
+  if (typeof window !== "undefined") {
+    throw new Error("getShareWrappingSecret() is strictly server-only.");
+  }
+
+  const secret =
+    process.env.AWAAZ_KEY_SECRET ??
+    process.env.SUPABASE_SERVICE_ROLE_KEY ??
+    process.env.SUPABASE_SECRET_KEY;
+
+  if (!secret) {
+    throw new Error(
+      "Missing AWAAZ_KEY_SECRET or SUPABASE_SERVICE_ROLE_KEY in server environment."
+    );
+  }
+
+  return secret;
+}

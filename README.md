@@ -1,104 +1,39 @@
 # Awaaz
 
-A cybersecurity hackathon platform designed to give college students a safe, structured way to report ragging or harassment anonymously and track committee action using a Case ID.
-
-> **Current Status:** Next.js App Router frontend connected to **Supabase** (`@supabase/supabase-js` + `@supabase/ssr`) for client/server sessions and committee authentication. No client-side encryption is claimed in this setup.
+A cybersecurity hackathon platform enabling college students to report ragging or harassment anonymously with **AES-256-GCM** envelope encryption, **2-of-N Shamir + RSA-OAEP** dual-key committee unlocking, encrypted private evidence storage, and SHA-256 hash-chained audit logs.
 
 ## Tech Stack
 
 - **Framework:** Next.js (App Router)
-- **UI Library:** React
-- **Language:** TypeScript (strict mode)
-- **Styling:** Tailwind CSS v4
-- **Icons:** Lucide React
-- **Backend & Auth:** Supabase (`@supabase/supabase-js`, `@supabase/ssr`)
-
-## Routes
-
-| Route | Purpose |
-| --- | --- |
-| `/` | Landing page introducing Awaaz, design principles, and reporting flow |
-| `/report` | Anonymous complaint intake form UI (client-side validation; awaiting column mapping for `complaints`) |
-| `/track` | Case ID lookup UI and planned review lifecycle template |
-| `/committee/login` | Committee portal sign-in wired to Supabase Auth |
-| `/committee/dashboard` | Committee triage dashboard wired to Supabase Auth & `complaints` query when signed in |
-| `/about` | Project mission, tech stack, and phased roadmap |
+- **UI Library:** React & TypeScript
+- **Styling:** Tailwind CSS v4 & Lucide React
+- **Database, Auth & Private Storage:** Supabase (`@supabase/supabase-js`, `@supabase/ssr`)
+- **Cryptography:** Node.js `crypto` (AES-256-GCM, RSA-OAEP-256, HKDF-SHA256, SHA-256) + GF(256) 2-of-N Shamir Secret Sharing
 
 ## Environment Configuration
 
-Supabase keys are stored in `.env.local` (ignored by Git). See `.env.example` for the expected variables:
+Copy `.env.example` to `.env.local` (never commit `.env.local` or expose `SUPABASE_SERVICE_ROLE_KEY` with `NEXT_PUBLIC_`):
 
 ```env
 NEXT_PUBLIC_SUPABASE_URL=https://your-project-ref.supabase.co
 NEXT_PUBLIC_SUPABASE_ANON_KEY=your-supabase-publishable-or-anon-key
+SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-or-secret-key
+AWAAZ_KEY_SECRET=replace-with-a-long-random-server-secret
 ```
 
-## Project Structure
+## API & Page Routes
 
-```text
-awaaz/
-├── .env.example
-├── .gitignore
-├── eslint.config.mjs
-├── next.config.ts
-├── package.json
-├── postcss.config.mjs
-├── README.md
-├── tsconfig.json
-└── src/
-    ├── proxy.ts
-    ├── app/
-    │   ├── about/page.tsx
-    │   ├── committee/
-    │   │   ├── dashboard/page.tsx
-    │   │   └── login/page.tsx
-    │   ├── report/page.tsx
-    │   ├── track/page.tsx
-    │   ├── globals.css
-    │   ├── layout.tsx
-    │   └── page.tsx
-    ├── components/
-    │   ├── layout/
-    │   │   ├── Footer.tsx
-    │   │   └── Navbar.tsx
-    │   ├── sections/
-    │   │   ├── CommitteeDashboardClient.tsx
-    │   │   ├── CommitteeLoginForm.tsx
-    │   │   ├── ReportForm.tsx
-    │   │   └── TrackCaseClient.tsx
-    │   └── ui/
-    │       ├── Badge.tsx
-    │       ├── Button.tsx
-    │       ├── Card.tsx
-    │       ├── FormField.tsx
-    │       ├── PageHeader.tsx
-    │       ├── SectionHeader.tsx
-    │       └── StatusNotice.tsx
-    └── lib/
-        ├── constants.ts
-        └── supabase/
-            ├── client.ts
-            ├── config.ts
-            ├── proxy.ts
-            └── server.ts
-```
+- `/` — Landing page
+- `/report` & `POST /api/complaints` — Rate-limited anonymous intake encrypting payload & evidence before storing in `complaints`, `evidence_files`, `awaaz-evidence`, and `audit_logs`
+- `/track`, `POST /api/complaints/track`, `POST /api/evidence` — Anonymous Case ID status lookup and recovery-secret-verified encrypted evidence upload
+- `/committee/login` & `/auth/callback` — Committee sign-in, sign-up with email verification, and password recovery
+- `/committee/dashboard` — Protected committee workspace wired to `/api/committee/dashboard`, `/api/committee/keys`, `/api/committee/unlock`, `/api/committee/status`, and `/api/committee/audit-logs`
+- `/api/health` — Public Supabase connectivity & table/bucket verification endpoint
 
-## Getting Started
+## Scripts
 
-1. Ensure Node.js LTS and npm are installed.
-2. Install dependencies:
-
-   ```bash
-   npm install
-   ```
-
-3. Copy `.env.example` to `.env.local` and fill in your Supabase URL and publishable/anon key.
-4. Start the development server:
-
-   ```bash
-   npm run dev
-   ```
-
-   *(On Windows PowerShell if script execution is restricted, use `npm.cmd run dev`.)*
-
-5. Open `http://localhost:3000` in your browser.
+- `npm run dev` — Start development server (`npm.cmd run dev` on restricted PowerShell)
+- `npm run build` — Build production bundle
+- `npm run test` — Run AES-256-GCM & Shamir unit tests
+- `npm run typecheck` — Run TypeScript type check
+- `npm run lint` — Run ESLint

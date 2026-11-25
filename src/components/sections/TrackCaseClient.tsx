@@ -1,6 +1,6 @@
 "use client";
 
-import { CheckCircle2, Clock, Search, Shield } from "lucide-react";
+import { CheckCircle2, Clock, FileUp, Search, Shield } from "lucide-react";
 import { type FormEvent, useState } from "react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -9,25 +9,137 @@ import { FormField, Input } from "@/components/ui/FormField";
 import { StatusNotice } from "@/components/ui/StatusNotice";
 import { PLANNED_CASE_STAGES } from "@/lib/constants";
 
-/** Case tracking UI shell with planned lifecycle preview (no fake backend lookups). */
+interface TrackResult {
+  caseCode: string;
+  category: string;
+  status: string;
+  encryptionAlgorithm: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  retentionUntil: string | null;
+  evidenceCount: number;
+  recoveryVerified: boolean | null;
+}
+
+/** Live anonymous Case ID lookup and authorized follow-up evidence uploader. */
 export function TrackCaseClient() {
   const [caseId, setCaseId] = useState("");
+  const [recoverySecret, setRecoverySecret] = useState("");
   const [error, setError] = useState("");
-  const [lookupAttempted, setLookupAttempted] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [result, setResult] = useState<TrackResult | null>(null);
 
-  const handleLookup = (event: FormEvent<HTMLFormElement>) => {
+  const [evidenceFile, setEvidenceFile] = useState<File | null>(null);
+  const [uploadStatus, setUploadStatus] = useState("");
+  const [uploadError, setUploadError] = useState("");
+  const [isUploading, setIsUploading] = useState(false);
+
+  const handleLookup = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const trimmed = caseId.trim();
+    const trimmed = caseId.trim().toUpperCase();
 
     if (!trimmed) {
-      setError("Please enter a Case ID to inspect the lookup flow.");
-      setLookupAttempted(false);
+      setError("Please enter your Case ID.");
+      setResult(null);
       return;
     }
 
     setError("");
-    setLookupAttempted(true);
+    setUploadStatus("");
+    setUploadError("");
+    setIsLoading(true);
+
+    try {
+      const res = await fetch("/api/complaints/track", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          caseCode: trimmed,
+          recoverySecret: recoverySecret.trim() || undefined,
+        }),
+      });
+      const json = (await res.json()) as Record<string, unknown>;
+
+      if (!res.ok) {
+        setResult(null);
+        setError(
+          typeof json.error === "string"
+            ? json.error
+            : "Unable to find that Case ID."
+        );
+        return;
+      }
+
+      setResult({
+        caseCode: String(json.caseCode ?? trimmed),
+        category: String(json.category ?? "General"),
+        status: String(json.status ?? "submitted"),
+        encryptionAlgorithm:
+          typeof json.encryptionAlgorithm === "string"
+            ? json.encryptionAlgorithm
+            : null,
+        createdAt: typeof json.createdAt === "string" ? json.createdAt : null,
+        updatedAt: typeof json.updatedAt === "string" ? json.updatedAt : null,
+        retentionUntil:
+          typeof json.retentionUntil === "string" ? json.retentionUntil : null,
+        evidenceCount: Number(json.evidenceCount ?? 0),
+        recoveryVerified:
+          typeof json.recoveryVerified === "boolean"
+            ? json.recoveryVerified
+            : null,
+      });
+    } catch {
+      setResult(null);
+      setError("Network error while looking up complaint status.");
+    } finally {
+      setIsLoading(false);
+    }
   };
+
+  const handleEvidenceUpload = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!result || !evidenceFile || !recoverySecret.trim()) return;
+
+    setIsUploading(true);
+    setUploadError("");
+    setUploadStatus("");
+
+    try {
+      const formData = new FormData();
+      formData.set("caseCode", result.caseCode);
+      formData.set("recoverySecret", recoverySecret.trim());
+      formData.set("file", evidenceFile);
+
+      const res = await fetch("/api/evidence", {
+        method: "POST",
+        body: formData,
+      });
+      const json = (await res.json()) as Record<string, unknown>;
+
+      if (!res.ok) {
+        setUploadError(
+          typeof json.error === "string"
+            ? json.error
+            : "Failed to upload encrypted evidence."
+        );
+        return;
+      }
+
+      setEvidenceFile(null);
+      setUploadStatus("Encrypted evidence uploaded to awaaz-evidence.");
+      setResult((prev) =>
+        prev ? { ...prev, evidenceCount: prev.evidenceCount + 1 } : prev
+      );
+    } catch {
+      setUploadError("Network error while uploading evidence.");
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const activeStageIndex = result
+    ? PLANNED_CASE_STAGES.findIndex((s) => s.id === result.status)
+    : -1;
 
   return (
     <div className="space-y-8">
@@ -35,51 +147,148 @@ export function TrackCaseClient() {
         <CardHeader className="border-b border-slate-100">
           <CardTitle>Look Up Complaint Status</CardTitle>
           <p className="mt-1 text-sm text-slate-600">
-            Enter the reference Case ID issued when a report is logged.
+            Enter your Case ID (and optionally your Recovery Secret to attach
+            additional encrypted evidence).
           </p>
         </CardHeader>
         <CardContent className="pt-6">
-          <form
-            onSubmit={handleLookup}
-            className="flex flex-col gap-4 sm:flex-row sm:items-end"
-            noValidate
-          >
-            <div className="flex-1">
+          <form onSubmit={handleLookup} className="space-y-4" noValidate>
+            <div className="grid gap-4 sm:grid-cols-2">
               <FormField
                 id="caseId"
                 label="Case Reference ID"
-                hint="Planned format example: AWZ-2026-XXXXXX"
+                hint="Example: AWZ-ABCD-EFGH-JKLM"
                 error={error}
+                required
               >
                 <Input
                   id="caseId"
                   type="text"
                   className="font-mono uppercase"
-                  placeholder="Enter Case ID..."
+                  placeholder="AWZ-XXXX-XXXX-XXXX"
                   value={caseId}
                   onChange={(e) => setCaseId(e.target.value)}
+                  disabled={isLoading}
+                />
+              </FormField>
+
+              <FormField
+                id="recoverySecret"
+                label="Recovery Secret (Optional)"
+                hint="Only needed if adding follow-up encrypted evidence."
+              >
+                <Input
+                  id="recoverySecret"
+                  type="text"
+                  className="font-mono uppercase"
+                  placeholder="XXXXXX-XXXXXX"
+                  value={recoverySecret}
+                  onChange={(e) => setRecoverySecret(e.target.value)}
+                  disabled={isLoading}
                 />
               </FormField>
             </div>
-            <Button type="submit" variant="primary" size="lg" className="sm:mb-6">
+
+            <Button
+              type="submit"
+              variant="primary"
+              size="lg"
+              disabled={isLoading}
+            >
               <Search className="h-4 w-4" />
-              Check Status
+              {isLoading ? "Checking..." : "Check Status"}
             </Button>
           </form>
 
-          {lookupAttempted ? (
-            <StatusNotice
-              title="Case Lookup Pending Supabase Integration"
-              variant="warning"
-              className="mt-6"
-            >
-              Lookup was requested for{" "}
-              <code className="rounded bg-amber-100 px-1.5 py-0.5 font-mono text-xs font-semibold">
-                {caseId.trim().toUpperCase()}
-              </code>
-              . Live database queries are not connected yet, so no real or mock
-              case status is returned.
-            </StatusNotice>
+          {result ? (
+            <div className="mt-6 space-y-4 border-t border-slate-100 pt-6">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-xs font-semibold tracking-wider text-slate-500 uppercase">
+                    Case Status
+                  </p>
+                  <p className="mt-1 font-mono text-lg font-bold text-navy-950">
+                    {result.caseCode}
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Badge variant="navy">{result.status}</Badge>
+                  <Badge variant="outline">{result.category}</Badge>
+                  <Badge variant="slate">
+                    {result.evidenceCount} Evidence File
+                    {result.evidenceCount === 1 ? "" : "s"}
+                  </Badge>
+                </div>
+              </div>
+
+              <div className="grid gap-3 rounded-xl border border-slate-200 bg-slate-50/70 p-4 text-xs text-slate-600 sm:grid-cols-3">
+                <div>
+                  <span className="font-semibold text-slate-900">Submitted:</span>{" "}
+                  {result.createdAt
+                    ? new Date(result.createdAt).toLocaleString()
+                    : "—"}
+                </div>
+                <div>
+                  <span className="font-semibold text-slate-900">Updated:</span>{" "}
+                  {result.updatedAt
+                    ? new Date(result.updatedAt).toLocaleString()
+                    : "—"}
+                </div>
+                <div>
+                  <span className="font-semibold text-slate-900">
+                    Encryption:
+                  </span>{" "}
+                  {result.encryptionAlgorithm ?? "AES-256-GCM"}
+                </div>
+              </div>
+
+              {result.recoveryVerified === false ? (
+                <StatusNotice title="Recovery Secret Mismatch" variant="warning">
+                  The Case ID matched, but the Recovery Secret did not match.
+                  Follow-up evidence uploads remain locked.
+                </StatusNotice>
+              ) : null}
+
+              {result.recoveryVerified === true ? (
+                <form
+                  onSubmit={handleEvidenceUpload}
+                  className="space-y-3 rounded-xl border border-navy-700/20 bg-navy-50/40 p-4"
+                >
+                  <div className="flex items-center gap-2 text-sm font-semibold text-navy-950">
+                    <FileUp className="h-4 w-4 text-navy-700" />
+                    Attach Follow-Up Encrypted Evidence
+                  </div>
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+                    <input
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp,application/pdf,text/plain"
+                      onChange={(e) =>
+                        setEvidenceFile(e.target.files?.[0] ?? null)
+                      }
+                      className="text-xs text-slate-700"
+                    />
+                    <Button
+                      type="submit"
+                      variant="primary"
+                      size="sm"
+                      disabled={!evidenceFile || isUploading}
+                    >
+                      {isUploading ? "Encrypting..." : "Upload Encrypted File"}
+                    </Button>
+                  </div>
+                  {uploadError ? (
+                    <p className="text-xs font-medium text-red-700">
+                      {uploadError}
+                    </p>
+                  ) : null}
+                  {uploadStatus ? (
+                    <p className="text-xs font-medium text-emerald-700">
+                      {uploadStatus}
+                    </p>
+                  ) : null}
+                </form>
+              ) : null}
+            </div>
           ) : null}
         </CardContent>
       </Card>
@@ -87,41 +296,68 @@ export function TrackCaseClient() {
       <Card subtle>
         <CardHeader className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <CardTitle>Planned Review Lifecycle</CardTitle>
+            <CardTitle>Case Review Lifecycle</CardTitle>
             <p className="mt-1 text-sm text-slate-600">
-              Structure of the status timeline that will display once backend
-              tracking is connected.
+              Non-sensitive status progression for your Case ID.
             </p>
           </div>
-          <Badge variant="outline">Template Layout</Badge>
+          <Badge variant="outline">
+            {result ? `Current: ${result.status}` : "Status Stages"}
+          </Badge>
         </CardHeader>
         <CardContent className="pt-2">
           <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-            {PLANNED_CASE_STAGES.map((stage, index) => (
-              <div
-                key={stage.id}
-                className="relative rounded-xl border border-slate-200 bg-white p-4 shadow-2xs"
-              >
-                <div className="flex items-center justify-between">
-                  <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg bg-navy-50 font-mono text-xs font-bold text-navy-900">
-                    0{index + 1}
-                  </span>
-                  {index === 0 ? (
-                    <Shield className="h-4 w-4 text-navy-700" />
-                  ) : index === PLANNED_CASE_STAGES.length - 1 ? (
-                    <CheckCircle2 className="h-4 w-4 text-slate-400" />
-                  ) : (
-                    <Clock className="h-4 w-4 text-slate-400" />
-                  )}
+            {PLANNED_CASE_STAGES.map((stage, index) => {
+              const isCompletedOrActive =
+                activeStageIndex >= 0 && index <= activeStageIndex;
+              return (
+                <div
+                  key={stage.id}
+                  className={`relative rounded-xl border p-4 shadow-2xs ${
+                    isCompletedOrActive
+                      ? "border-navy-700 bg-white ring-1 ring-navy-700/15"
+                      : "border-slate-200 bg-white"
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span
+                      className={`inline-flex h-7 w-7 items-center justify-center rounded-lg font-mono text-xs font-bold ${
+                        isCompletedOrActive
+                          ? "bg-navy-900 text-white"
+                          : "bg-navy-50 text-navy-900"
+                      }`}
+                    >
+                      0{index + 1}
+                    </span>
+                    {index === 0 ? (
+                      <Shield className="h-4 w-4 text-navy-700" />
+                    ) : index === PLANNED_CASE_STAGES.length - 1 ? (
+                      <CheckCircle2
+                        className={`h-4 w-4 ${
+                          isCompletedOrActive
+                            ? "text-emerald-700"
+                            : "text-slate-400"
+                        }`}
+                      />
+                    ) : (
+                      <Clock
+                        className={`h-4 w-4 ${
+                          isCompletedOrActive
+                            ? "text-navy-700"
+                            : "text-slate-400"
+                        }`}
+                      />
+                    )}
+                  </div>
+                  <h4 className="mt-3 text-sm font-semibold text-slate-900">
+                    {stage.label}
+                  </h4>
+                  <p className="mt-1.5 text-xs leading-relaxed text-slate-600">
+                    {stage.description}
+                  </p>
                 </div>
-                <h4 className="mt-3 text-sm font-semibold text-slate-900">
-                  {stage.label}
-                </h4>
-                <p className="mt-1.5 text-xs leading-relaxed text-slate-600">
-                  {stage.description}
-                </p>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </CardContent>
       </Card>

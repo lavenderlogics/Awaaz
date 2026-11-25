@@ -16,7 +16,7 @@ export default function TrackPage() {
         eyebrow="Case Follow-Up"
         title="Track Your Complaint Status"
         description="Look up progress using your reference Case ID without logging into a student account."
-        badgeText="UI Setup · Lookup Pending"
+        badgeText="Live Case Lookup"
         actions={
           <LinkButton href="/report" variant="outline" size="md">
             File a New Report

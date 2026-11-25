@@ -1,38 +1,24 @@
 import type { Metadata } from "next";
-import {
-  CommitteeDashboardClient,
-  type CommitteeComplaintRow,
-} from "@/components/sections/CommitteeDashboardClient";
+import { CommitteeDashboardClient } from "@/components/sections/CommitteeDashboardClient";
 import { LinkButton } from "@/components/ui/Button";
 import { PageHeader } from "@/components/ui/PageHeader";
-import { isSupabaseConfigured } from "@/lib/supabase/config";
+import {
+  isServiceRoleConfigured,
+  isSupabaseConfigured,
+} from "@/lib/supabase/config";
 import { createClient } from "@/lib/supabase/server";
 
 export const metadata: Metadata = {
   title: "Committee Dashboard",
   description:
-    "Committee triage dashboard for reviewing and updating campus complaints.",
+    "Committee triage dashboard for reviewing and unlocking encrypted campus complaints.",
 };
-
-function readStringField(
-  row: Record<string, unknown>,
-  keys: string[],
-  fallback: string
-): string {
-  for (const key of keys) {
-    const value = row[key];
-    if (typeof value === "string" && value.trim()) {
-      return value;
-    }
-  }
-  return fallback;
-}
 
 export default async function CommitteeDashboardPage() {
   const configured = isSupabaseConfigured();
+  const serviceRoleReady = isServiceRoleConfigured();
   let userEmail: string | null = null;
-  let complaints: CommitteeComplaintRow[] = [];
-  let queryError: string | null = null;
+  let userId: string | null = null;
 
   if (configured) {
     try {
@@ -41,48 +27,10 @@ export default async function CommitteeDashboardPage() {
         data: { user },
       } = await supabase.auth.getUser();
       userEmail = user?.email ?? null;
-
-      if (user) {
-        const { data, error } = await supabase
-          .from("complaints")
-          .select("*")
-          .limit(50);
-
-        if (error) {
-          queryError = error.message;
-        } else if (Array.isArray(data)) {
-          complaints = data.map((item, idx) => {
-            const record = item as Record<string, unknown>;
-            return {
-              id: readStringField(record, ["id"], String(idx)),
-              caseId: readStringField(
-                record,
-                ["case_id", "tracking_id", "reference_id", "id"],
-                "—"
-              ),
-              category: readStringField(
-                record,
-                ["category", "type"],
-                "Uncategorized"
-              ),
-              location: readStringField(
-                record,
-                ["location", "campus_location"],
-                "—"
-              ),
-              urgency: readStringField(
-                record,
-                ["urgency", "severity"],
-                "standard"
-              ),
-              status: readStringField(record, ["status"], "submitted"),
-            };
-          });
-        }
-      }
-    } catch (err) {
-      queryError =
-        err instanceof Error ? err.message : "Unable to reach Supabase.";
+      userId = user?.id ?? null;
+    } catch {
+      userEmail = null;
+      userId = null;
     }
   }
 
@@ -91,7 +39,7 @@ export default async function CommitteeDashboardPage() {
       <PageHeader
         eyebrow="Committee Workspace"
         title="Complaint Triage Dashboard"
-        description="Centralized review queue, status filters, and Supabase Auth integration for authorized campus committee members."
+        description="Centralized review queue, dual-key decryption workflow, and hash-chained audit logs for authorized committee officers."
         badgeText={
           !configured
             ? "Supabase Env Required"
@@ -109,9 +57,9 @@ export default async function CommitteeDashboardPage() {
       <section className="mx-auto max-w-6xl px-4 py-10 sm:px-6 sm:py-14 lg:px-8">
         <CommitteeDashboardClient
           isConfigured={configured}
+          isServiceRoleReady={serviceRoleReady}
           userEmail={userEmail}
-          complaints={complaints}
-          queryError={queryError}
+          userId={userId}
         />
       </section>
     </div>

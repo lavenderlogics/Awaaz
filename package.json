@@ -2,13 +2,14 @@
   "name": "awaaz",
   "version": "0.1.0",
   "private": true,
-  "description": "Awaaz — Secure anonymous campus complaint reporting platform (initial Next.js setup)",
+  "description": "Awaaz — Secure anonymous campus complaint reporting platform",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/crypto.test.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",
