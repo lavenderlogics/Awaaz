@@ -89,13 +89,16 @@ export async function verifySupabaseConnection(): Promise<SupabaseHealthReport> 
 
     const tableChecks = await Promise.all(
       AWAAZ_TABLES.map(async (tableName) => {
-        const { error } = await admin
+        const { error, status } = await admin
           .from(tableName)
-          .select("*", { head: true, count: "exact" });
+          .select("*", { count: "exact" })
+          .limit(0);
         return {
           tableName,
           ok: !error,
-          errorMessage: error?.message ?? null,
+          errorMessage: error
+            ? `${error.code || status || "ERR"}: ${error.message || error.hint || "Denied"}`
+            : null,
         };
       })
     );
