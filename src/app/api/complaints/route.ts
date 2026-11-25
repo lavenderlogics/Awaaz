@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { NextResponse } from "next/server";
+import { mapUiCategoryToDbCategory } from "@/lib/constants";
 import { appendAuditLog } from "@/lib/security/audit";
 import {
   type CommitteeRecipientKey,
@@ -198,7 +199,10 @@ export async function POST(request: Request) {
     Date.now() + 365 * 24 * 60 * 60 * 1000
   ).toISOString();
 
+  const dbCategory = mapUiCategoryToDbCategory(parsed.category.trim());
+
   const sensitivePayload = {
+    detailedCategory: parsed.category.trim(),
     urgency,
     incidentDate: parsed.incidentDate.trim(),
     location,
@@ -217,7 +221,7 @@ export async function POST(request: Request) {
     id: complaintId,
     case_code_hash: tracking.caseCodeHash,
     recovery_secret_hash: tracking.recoverySecretHash,
-    category: parsed.category.trim(),
+    category: dbCategory,
     encrypted_payload: JSON.stringify(envelope),
     encryption_algorithm: ENCRYPTION_ALGORITHM,
     status: "submitted",
@@ -287,7 +291,7 @@ export async function POST(request: Request) {
     actorMemberId: null,
     eventType: "COMPLAINT_SUBMITTED",
     eventDetails: {
-      category: parsed.category.trim(),
+      category: dbCategory,
       encryptionAlgorithm: ENCRYPTION_ALGORITHM,
       evidenceCount: uploadedCount,
       threshold: `${REQUIRED_UNLOCK_APPROVALS}-of-${recipients.length}`,

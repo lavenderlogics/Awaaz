@@ -19,6 +19,13 @@ export const INCIDENT_CATEGORIES = [
   "Other Safety Concern",
 ] as const;
 
+/** Maps UI incident labels to the database `complaints_category_check` values. */
+export function mapUiCategoryToDbCategory(
+  uiCategory: string
+): "ragging" | "harassment" {
+  return uiCategory === "Ragging / Hazing" ? "ragging" : "harassment";
+}
+
 export const PLANNED_CASE_STAGES = [
   {
     id: "submitted",
@@ -31,14 +38,14 @@ export const PLANNED_CASE_STAGES = [
     description: "Assigned to authorized campus committee members for triage.",
   },
   {
-    id: "action_initiated",
-    label: "Action Initiated",
-    description: "Preliminary inquiry or campus safety intervention underway.",
-  },
-  {
     id: "resolved",
     label: "Resolved",
-    description: "Final outcome recorded and closure note posted for the Case ID.",
+    description: "Committee inquiry completed and resolution recorded.",
+  },
+  {
+    id: "closed",
+    label: "Closed",
+    description: "Final closure archived for the Case ID.",
   },
 ] as const;
 

@@ -20,7 +20,7 @@ import { Button, LinkButton } from "@/components/ui/Button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { FormField, Input, Select, Textarea } from "@/components/ui/FormField";
 import { StatusNotice } from "@/components/ui/StatusNotice";
-import { INCIDENT_CATEGORIES, PLANNED_CASE_STAGES } from "@/lib/constants";
+import { PLANNED_CASE_STAGES } from "@/lib/constants";
 import { createClient } from "@/lib/supabase/client";
 
 interface DashboardComplaint {
@@ -228,7 +228,9 @@ export function CommitteeDashboardClient({
       awaitingUnlock: complaints.filter(
         (c) => c.approvalCount < c.requiredApprovals
       ).length,
-      resolved: complaints.filter((c) => c.status === "resolved").length,
+      resolved: complaints.filter((c) =>
+        ["resolved", "closed"].includes(c.status)
+      ).length,
     };
   }, [complaints, currentMember, userEmail]);
 
@@ -516,11 +518,8 @@ export function CommitteeDashboardClient({
                 aria-label="Filter by category"
               >
                 <option value="all">All Categories</option>
-                {INCIDENT_CATEGORIES.map((category) => (
-                  <option key={category} value={category}>
-                    {category}
-                  </option>
-                ))}
+                <option value="ragging">Ragging</option>
+                <option value="harassment">Harassment</option>
               </Select>
               <Select
                 value={selectedStatus}
