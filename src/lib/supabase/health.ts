@@ -1,8 +1,10 @@
 import "server-only";
 import { createAdminClient } from "@/lib/supabase/admin";
 import {
+  getServiceRoleKeyType,
   isServiceRoleConfigured,
   isSupabaseConfigured,
+  type ServiceRoleKeyType,
 } from "@/lib/supabase/config";
 import { createClient } from "@/lib/supabase/server";
 
@@ -19,9 +21,11 @@ export const EVIDENCE_BUCKET_NAME = "awaaz-evidence";
 export interface SupabaseHealthReport {
   publicConfigured: boolean;
   serviceRoleConfigured: boolean;
+  serviceRoleKeyType: ServiceRoleKeyType | null;
   authReachable: boolean;
   storageBucketVerified: boolean | null;
   tablesVerified: Record<string, boolean> | null;
+  adminError: string | null;
   error: string | null;
 }
 
@@ -32,14 +36,17 @@ export interface SupabaseHealthReport {
 export async function verifySupabaseConnection(): Promise<SupabaseHealthReport> {
   const publicConfigured = isSupabaseConfigured();
   const serviceRoleConfigured = isServiceRoleConfigured();
+  const serviceRoleKeyType = getServiceRoleKeyType();
 
   if (!publicConfigured) {
     return {
       publicConfigured: false,
       serviceRoleConfigured,
+      serviceRoleKeyType,
       authReachable: false,
       storageBucketVerified: null,
       tablesVerified: null,
+      adminError: null,
       error: "Public Supabase environment variables are not configured.",
     };
   }
@@ -64,15 +71,18 @@ export async function verifySupabaseConnection(): Promise<SupabaseHealthReport> 
     return {
       publicConfigured,
       serviceRoleConfigured: false,
+      serviceRoleKeyType: null,
       authReachable,
       storageBucketVerified: null,
       tablesVerified: null,
+      adminError: null,
       error: errorMessage,
     };
   }
 
   const tablesVerified: Record<string, boolean> = {};
   let storageBucketVerified = false;
+  let adminError: string | null = null;
 
   try {
     const admin = createAdminClient();
@@ -82,19 +92,29 @@ export async function verifySupabaseConnection(): Promise<SupabaseHealthReport> 
         const { error } = await admin
           .from(tableName)
           .select("*", { head: true, count: "exact" });
-        return [tableName, !error] as const;
+        return {
+          tableName,
+          ok: !error,
+          errorMessage: error?.message ?? null,
+        };
       })
     );
 
-    for (const [tableName, ok] of tableChecks) {
-      tablesVerified[tableName] = ok;
+    for (const check of tableChecks) {
+      tablesVerified[check.tableName] = check.ok;
+      if (!check.ok && !adminError && check.errorMessage) {
+        adminError = `${check.tableName}: ${check.errorMessage}`;
+      }
     }
 
     const { data: bucket, error: bucketError } =
       await admin.storage.getBucket(EVIDENCE_BUCKET_NAME);
     storageBucketVerified = !bucketError && Boolean(bucket);
+    if (bucketError && !adminError) {
+      adminError = `storage(${EVIDENCE_BUCKET_NAME}): ${bucketError.message}`;
+    }
   } catch (err) {
-    errorMessage =
+    adminError =
       err instanceof Error
         ? err.message
         : "Admin client verification failed.";
@@ -103,9 +123,11 @@ export async function verifySupabaseConnection(): Promise<SupabaseHealthReport> 
   return {
     publicConfigured,
     serviceRoleConfigured,
+    serviceRoleKeyType,
     authReachable,
     storageBucketVerified,
     tablesVerified,
+    adminError,
     error: errorMessage,
   };
 }

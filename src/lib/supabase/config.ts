@@ -8,12 +8,19 @@ export interface SupabaseAdminConfig {
   serviceRoleKey: string;
 }
 
+export type ServiceRoleKeyType =
+  | "sb_secret"
+  | "jwt"
+  | "sb_publishable"
+  | "other";
+
 /** Reads public Supabase project URL and publishable/anon key from env. */
 export function getSupabaseConfig(): SupabaseConfig {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anonKey =
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
+  const anonKey = (
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ??
-    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
+  )?.trim();
 
   if (!url || !anonKey) {
     throw new Error(
@@ -26,10 +33,11 @@ export function getSupabaseConfig(): SupabaseConfig {
 
 /** Returns true when public Supabase environment variables are configured. */
 export function isSupabaseConfigured(): boolean {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anonKey =
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
+  const anonKey = (
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ??
-    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
+  )?.trim();
 
   return Boolean(url && anonKey);
 }
@@ -42,9 +50,10 @@ export function getSupabaseServiceRoleConfig(): SupabaseAdminConfig {
     );
   }
 
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const serviceRoleKey =
-    process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SECRET_KEY;
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
+  const serviceRoleKey = (
+    process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SECRET_KEY
+  )?.trim();
 
   if (!url || !serviceRoleKey) {
     throw new Error(
@@ -61,11 +70,24 @@ export function isServiceRoleConfigured(): boolean {
     return false;
   }
 
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const serviceRoleKey =
-    process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SECRET_KEY;
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
+  const serviceRoleKey = (
+    process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SECRET_KEY
+  )?.trim();
 
   return Boolean(url && serviceRoleKey);
+}
+
+/** Classifies the configured server key format without exposing any secret bytes. */
+export function getServiceRoleKeyType(): ServiceRoleKeyType | null {
+  if (!isServiceRoleConfigured()) {
+    return null;
+  }
+  const { serviceRoleKey } = getSupabaseServiceRoleConfig();
+  if (serviceRoleKey.startsWith("sb_secret_")) return "sb_secret";
+  if (serviceRoleKey.startsWith("sb_publishable_")) return "sb_publishable";
+  if (serviceRoleKey.startsWith("eyJ")) return "jwt";
+  return "other";
 }
 
 /** Returns a server-only secret for wrapping intermediate unlock shares. */
@@ -74,10 +96,11 @@ export function getShareWrappingSecret(): string {
     throw new Error("getShareWrappingSecret() is strictly server-only.");
   }
 
-  const secret =
+  const secret = (
     process.env.AWAAZ_KEY_SECRET ??
     process.env.SUPABASE_SERVICE_ROLE_KEY ??
-    process.env.SUPABASE_SECRET_KEY;
+    process.env.SUPABASE_SECRET_KEY
+  )?.trim();
 
   if (!secret) {
     throw new Error(
