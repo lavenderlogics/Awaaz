@@ -263,10 +263,17 @@ export async function reconstructAndDecryptComplaintInBrowser<
   const decryptedShareBuffers: Uint8Array[] = [];
 
   try {
-    const myShareBytes = await unwrapShareInBrowser(
-      params.myEncryptedShareBase64,
-      params.myPrivateKey
-    );
+    let myShareBytes: Uint8Array;
+    try {
+      myShareBytes = await unwrapShareInBrowser(
+        params.myEncryptedShareBase64,
+        params.myPrivateKey
+      );
+    } catch {
+      throw new Error(
+        "Your own encrypted share in this complaint could not be decrypted with your current IndexedDB private key. If you rotated your key after this complaint was submitted, import the previous .pem backup or test with a newly submitted complaint."
+      );
+    }
     decryptedShareBuffers.push(myShareBytes);
 
     let paired = false;
@@ -291,7 +298,7 @@ export async function reconstructAndDecryptComplaintInBrowser<
 
     if (!paired || decryptedShareBuffers.length < 2) {
       throw new Error(
-        "No valid forwarded share from a distinct committee member could be decrypted with your private key."
+        "None of the forwarded shares could be decrypted for a distinct co-approver with your current IndexedDB private key. Ask your co-approver to forward their share again."
       );
     }
 
@@ -317,16 +324,23 @@ export async function reconstructAndDecryptComplaintInBrowser<
       combinedCipher.set(authTagBytes, cipherBytes.length);
 
       const aadBytes = new TextEncoder().encode(params.complaintId);
-      const plainBuf = await webCrypto.subtle.decrypt(
-        {
-          name: "AES-GCM",
-          iv: toArrayBuffer(ivBytes),
-          additionalData: toArrayBuffer(aadBytes),
-          tagLength: 128,
-        },
-        aesKey,
-        toArrayBuffer(combinedCipher)
-      );
+      let plainBuf: ArrayBuffer;
+      try {
+        plainBuf = await webCrypto.subtle.decrypt(
+          {
+            name: "AES-GCM",
+            iv: toArrayBuffer(ivBytes),
+            additionalData: toArrayBuffer(aadBytes),
+            tagLength: 128,
+          },
+          aesKey,
+          toArrayBuffer(combinedCipher)
+        );
+      } catch {
+        throw new Error(
+          "AES-256-GCM decryption failed after Shamir key reconstruction (ciphertext or authentication tag mismatch)."
+        );
+      }
 
       const payload = JSON.parse(new TextDecoder().decode(plainBuf)) as T;
       return {

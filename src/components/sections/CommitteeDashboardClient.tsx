@@ -211,6 +211,16 @@ export function CommitteeDashboardClient({
           return;
         }
 
+        const cryptoMatches = await verifyPrivateKeyMatchesPublicKeyInBrowser(
+          entry.privateKey,
+          member.publicKeyPem
+        );
+        if (!cryptoMatches) {
+          setLocalPrivateKey(null);
+          setLocalKeyStatus("mismatch");
+          return;
+        }
+
         setLocalPrivateKey(entry.privateKey);
         setLocalKeyStatus("ready");
       } catch {
@@ -339,6 +349,14 @@ export function CommitteeDashboardClient({
 
   const handleGenerateAndRegisterKey = async () => {
     if (!currentMember) return;
+    if (
+      currentMember.hasPublicKey &&
+      !window.confirm(
+        "You already have a registered public key. Rotating generates a new keypair ONLY for future complaints—existing complaints cannot be decrypted unless you saved your previous .pem backup. Continue?"
+      )
+    ) {
+      return;
+    }
     setIsGeneratingKey(true);
     setKeyStatusMessage("");
     setApiError("");
@@ -642,10 +660,12 @@ export function CommitteeDashboardClient({
       setUnlockFeedback(
         "AES-256 key reconstructed via Shamir GF(256) and complaint decrypted strictly inside your browser."
       );
-    } catch {
+    } catch (error) {
       setDecrypted(null);
       setUnlockError(
-        "Local decryption failed. Ensure your IndexedDB private key matches and the forwarded share came from a valid co-approver."
+        error instanceof Error && error.message
+          ? error.message
+          : "Local decryption failed. Ensure your IndexedDB private key matches and the forwarded share came from a valid co-approver."
       );
     } finally {
       setIsUnlocking(false);
