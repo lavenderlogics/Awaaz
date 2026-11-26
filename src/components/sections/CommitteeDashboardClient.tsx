@@ -323,6 +323,7 @@ export function CommitteeDashboardClient({
             status?: string;
             emailSent?: boolean;
             emailConfigured?: boolean;
+            targetAdminEmail?: string;
           };
           if (reqJson.status === "active") {
             [dashRes, auditRes] = await Promise.all([
@@ -331,12 +332,13 @@ export function CommitteeDashboardClient({
             ]);
             dashJson = (await dashRes.json()) as Record<string, unknown>;
           } else if (reqJson.status === "pending") {
+            const adminAddr = reqJson.targetAdminEmail ?? "agrawalvantika@gmail.com";
             setPendingNotice(
               reqJson.emailSent
-                ? "An authorization confirmation email has been sent to the committee administrator(s)."
+                ? `An authorization confirmation email has been sent to ${adminAddr}.`
                 : reqJson.emailConfigured
-                  ? "Your access request is queued for administrator approval."
-                  : "Your access request is queued in the Admin Pending Approvals list (configure RESEND_API_KEY for instant admin email alerts)."
+                  ? `Your access request is queued for administrator approval (${adminAddr}).`
+                  : `Your access request is registered as pending for administrator approval (${adminAddr} / Dashboard Admin Approvals).`
             );
           }
         } catch {
