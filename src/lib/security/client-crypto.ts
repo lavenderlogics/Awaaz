@@ -45,6 +45,86 @@ export interface BrowserEncryptedEvidenceResult {
 
 const FILE_MAGIC_BYTES = new Uint8Array([0x41, 0x57, 0x5a, 0x31]); // "AWZ1"
 
+/**
+ * Verifies raw file magic bytes / UTF-8 text integrity in browser memory before
+ * encryption so spoofed extensions or invalid MIME claims are rejected locally.
+ */
+export function validateEvidenceBytesSignature(
+  bytes: Uint8Array,
+  mimeType: string
+): { ok: true } | { ok: false; error: string } {
+  if (bytes.length === 0) {
+    return { ok: false, error: "Evidence file cannot be empty." };
+  }
+
+  switch (mimeType) {
+    case "image/png": {
+      const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+      const valid =
+        bytes.length >= sig.length && sig.every((b, idx) => bytes[idx] === b);
+      return valid
+        ? { ok: true }
+        : { ok: false, error: "File header does not match a valid PNG image." };
+    }
+    case "image/jpeg": {
+      const valid =
+        bytes.length >= 3 &&
+        bytes[0] === 0xff &&
+        bytes[1] === 0xd8 &&
+        bytes[2] === 0xff;
+      return valid
+        ? { ok: true }
+        : { ok: false, error: "File header does not match a valid JPEG image." };
+    }
+    case "image/webp": {
+      const valid =
+        bytes.length >= 12 &&
+        bytes[0] === 0x52 &&
+        bytes[1] === 0x49 &&
+        bytes[2] === 0x46 &&
+        bytes[3] === 0x46 &&
+        bytes[8] === 0x57 &&
+        bytes[9] === 0x45 &&
+        bytes[10] === 0x42 &&
+        bytes[11] === 0x50;
+      return valid
+        ? { ok: true }
+        : { ok: false, error: "File header does not match a valid WEBP image." };
+    }
+    case "application/pdf": {
+      const valid =
+        bytes.length >= 5 &&
+        bytes[0] === 0x25 &&
+        bytes[1] === 0x50 &&
+        bytes[2] === 0x44 &&
+        bytes[3] === 0x46 &&
+        bytes[4] === 0x2d;
+      return valid
+        ? { ok: true }
+        : { ok: false, error: "File header does not match a valid PDF document." };
+    }
+    case "text/plain": {
+      try {
+        new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      } catch {
+        return { ok: false, error: "Text evidence must be valid UTF-8 text." };
+      }
+      for (let i = 0; i < Math.min(bytes.length, 4096); i++) {
+        const b = bytes[i];
+        if (b === 0x00 || (b < 0x20 && b !== 0x09 && b !== 0x0a && b !== 0x0d)) {
+          return {
+            ok: false,
+            error: "Text evidence contains unsupported binary control bytes.",
+          };
+        }
+      }
+      return { ok: true };
+    }
+    default:
+      return { ok: false, error: "Unsupported evidence MIME type." };
+  }
+}
+
 function getWebCrypto(): Crypto {
   if (typeof globalThis.crypto === "undefined" || !globalThis.crypto.subtle) {
     throw new Error(
@@ -238,21 +318,15 @@ export async function forwardShareInBrowser(params: {
   }
 }
 
-/**
- * Member B workflow (C2 Step D):
- * Decrypts Member B's own wrapped share and >=1 forwarded share locally using B's
- * private CryptoKey, reconstructs the 32-byte AES-256 key via GF(256) Shamir,
- * and decrypts the AES-256-GCM complaint envelope entirely in browser memory.
- */
-export async function reconstructAndDecryptComplaintInBrowser<
-  T = Record<string, unknown>,
->(params: {
-  complaintId: string;
-  envelope: BrowserDecryptableEnvelope;
+async function reconstructAndDecryptAes256GcmBytes(params: {
+  aadText: string;
+  ivBase64: string;
+  authTagBase64: string;
+  cipherBytes: Uint8Array;
   myEncryptedShareBase64: string;
   forwardedEncryptedSharesBase64: string[];
   myPrivateKey: CryptoKey;
-}): Promise<{ payload: T; reconstructedKeyHexLength: number }> {
+}): Promise<{ plainBytes: Uint8Array; reconstructedKeyHexLength: number }> {
   if (params.forwardedEncryptedSharesBase64.length < 1) {
     throw new Error(
       "At least 1 forwarded share from another committee member is required."
@@ -271,7 +345,7 @@ export async function reconstructAndDecryptComplaintInBrowser<
       );
     } catch {
       throw new Error(
-        "Your own encrypted share in this complaint could not be decrypted with your current IndexedDB private key. If you rotated your key after this complaint was submitted, import the previous .pem backup or test with a newly submitted complaint."
+        "Your own encrypted share could not be decrypted with your current IndexedDB private key. If you rotated your key after submission, import your previous .pem backup."
       );
     }
     decryptedShareBuffers.push(myShareBytes);
@@ -314,16 +388,15 @@ export async function reconstructAndDecryptComplaintInBrowser<
         ["decrypt"]
       );
 
-      const ivBytes = base64ToBytes(params.envelope.iv);
-      const cipherBytes = base64ToBytes(params.envelope.ciphertext);
-      const authTagBytes = base64ToBytes(params.envelope.authTag);
+      const ivBytes = base64ToBytes(params.ivBase64);
+      const authTagBytes = base64ToBytes(params.authTagBase64);
       const combinedCipher = new Uint8Array(
-        cipherBytes.length + authTagBytes.length
+        params.cipherBytes.length + authTagBytes.length
       );
-      combinedCipher.set(cipherBytes, 0);
-      combinedCipher.set(authTagBytes, cipherBytes.length);
+      combinedCipher.set(params.cipherBytes, 0);
+      combinedCipher.set(authTagBytes, params.cipherBytes.length);
 
-      const aadBytes = new TextEncoder().encode(params.complaintId);
+      const aadBytes = new TextEncoder().encode(params.aadText);
       let plainBuf: ArrayBuffer;
       try {
         plainBuf = await webCrypto.subtle.decrypt(
@@ -342,9 +415,8 @@ export async function reconstructAndDecryptComplaintInBrowser<
         );
       }
 
-      const payload = JSON.parse(new TextDecoder().decode(plainBuf)) as T;
       return {
-        payload,
+        plainBytes: new Uint8Array(plainBuf),
         reconstructedKeyHexLength: rawDek.length * 2,
       };
     } finally {
@@ -355,6 +427,65 @@ export async function reconstructAndDecryptComplaintInBrowser<
       buf.fill(0);
     }
   }
+}
+
+/**
+ * Member B workflow (C2 Step D):
+ * Decrypts Member B's own wrapped share and >=1 forwarded share locally using B's
+ * private CryptoKey, reconstructs the 32-byte AES-256 key via GF(256) Shamir,
+ * and decrypts the AES-256-GCM complaint envelope entirely in browser memory.
+ */
+export async function reconstructAndDecryptComplaintInBrowser<
+  T = Record<string, unknown>,
+>(params: {
+  complaintId: string;
+  envelope: BrowserDecryptableEnvelope;
+  myEncryptedShareBase64: string;
+  forwardedEncryptedSharesBase64: string[];
+  myPrivateKey: CryptoKey;
+}): Promise<{ payload: T; reconstructedKeyHexLength: number }> {
+  const { plainBytes, reconstructedKeyHexLength } =
+    await reconstructAndDecryptAes256GcmBytes({
+      aadText: params.complaintId,
+      ivBase64: params.envelope.iv,
+      authTagBase64: params.envelope.authTag,
+      cipherBytes: base64ToBytes(params.envelope.ciphertext),
+      myEncryptedShareBase64: params.myEncryptedShareBase64,
+      forwardedEncryptedSharesBase64: params.forwardedEncryptedSharesBase64,
+      myPrivateKey: params.myPrivateKey,
+    });
+
+  const payload = JSON.parse(new TextDecoder().decode(plainBytes)) as T;
+  plainBytes.fill(0);
+  return { payload, reconstructedKeyHexLength };
+}
+
+/**
+ * Decrypts an `AWZ1` encrypted evidence file strictly inside the browser using
+ * the officer's own share and >=1 forwarded share from a co-approver.
+ */
+export async function reconstructAndDecryptEvidenceInBrowser(params: {
+  complaintId: string;
+  fileId: string;
+  ivBase64: string;
+  authTagBase64: string;
+  ciphertextBase64: string;
+  myEncryptedShareBase64: string;
+  forwardedEncryptedSharesBase64: string[];
+  myPrivateKey: CryptoKey;
+}): Promise<{ fileBytes: Uint8Array; reconstructedKeyHexLength: number }> {
+  const { plainBytes, reconstructedKeyHexLength } =
+    await reconstructAndDecryptAes256GcmBytes({
+      aadText: `${params.complaintId}:${params.fileId}`,
+      ivBase64: params.ivBase64,
+      authTagBase64: params.authTagBase64,
+      cipherBytes: base64ToBytes(params.ciphertextBase64),
+      myEncryptedShareBase64: params.myEncryptedShareBase64,
+      forwardedEncryptedSharesBase64: params.forwardedEncryptedSharesBase64,
+      myPrivateKey: params.myPrivateKey,
+    });
+
+  return { fileBytes: plainBytes, reconstructedKeyHexLength };
 }
 
 async function wrapDekSharesInBrowser(

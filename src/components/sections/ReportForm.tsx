@@ -1,6 +1,14 @@
 "use client";
 
-import { Check, Copy, FileUp, RotateCcw, Send, X } from "lucide-react";
+import {
+  Check,
+  Copy,
+  Download,
+  FileUp,
+  RotateCcw,
+  Send,
+  X,
+} from "lucide-react";
 import { type ChangeEvent, type FormEvent, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
@@ -11,16 +19,19 @@ import {
   encryptComplaintInBrowser,
   encryptEvidenceBytesInBrowser,
   type PublicCommitteeRecipient,
+  validateEvidenceBytesSignature,
 } from "@/lib/security/client-crypto";
 import {
   ALLOWED_EVIDENCE_MIME_TYPES,
   MAX_EVIDENCE_BYTES,
   MAX_EVIDENCE_FILES,
+  RETENTION_POLICY_OPTIONS,
 } from "@/lib/security/validation";
 
 interface ReportFormState {
   category: string;
   urgency: string;
+  retentionDays: number;
   incidentDate: string;
   location: string;
   description: string;
@@ -32,11 +43,15 @@ interface SubmissionSuccess {
   caseCode: string;
   recoverySecret: string;
   evidenceCount: number;
+  retentionUntil: string;
+  submittedAt: string;
+  evidenceHashes: Array<{ fileId: string; sha256: string }>;
 }
 
 const INITIAL_STATE: ReportFormState = {
   category: "",
   urgency: "standard",
+  retentionDays: 90,
   incidentDate: "",
   location: "",
   description: "",
@@ -180,11 +195,20 @@ export function ReportForm() {
         });
 
         const evidenceMeta: Array<{ fileId: string; mimeType: string }> = [];
+        const evidenceHashes: Array<{ fileId: string; sha256: string }> = [];
         const encryptedEvidenceFiles: Array<{ fileId: string; blob: Blob }> = [];
 
         for (const file of files) {
           const fileId = window.crypto.randomUUID();
           const rawBytes = new Uint8Array(await file.arrayBuffer());
+          const signatureCheck = validateEvidenceBytesSignature(
+            rawBytes,
+            file.type
+          );
+          if (!signatureCheck.ok) {
+            rawBytes.fill(0);
+            throw new Error(`"${file.name}": ${signatureCheck.error}`);
+          }
           const encryptedResult = await encryptEvidenceBytesInBrowser({
             fileBytes: rawBytes,
             mimeType: file.type,
@@ -198,6 +222,10 @@ export function ReportForm() {
             fileId: encryptedResult.fileId,
             mimeType: encryptedResult.mimeType,
           });
+          evidenceHashes.push({
+            fileId: encryptedResult.fileId,
+            sha256: encryptedResult.ciphertextHash,
+          });
           const copy = new Uint8Array(encryptedResult.encryptedBytes.byteLength);
           copy.set(encryptedResult.encryptedBytes);
           encryptedEvidenceFiles.push({
@@ -209,11 +237,51 @@ export function ReportForm() {
         body = new FormData();
         body.set("complaintId", complaintId);
         body.set("category", form.category);
+        body.set("retentionDays", String(form.retentionDays));
         body.set("encryptedPayload", JSON.stringify(envelope));
         body.set("evidenceMeta", JSON.stringify(evidenceMeta));
 
         for (const item of encryptedEvidenceFiles) {
           body.append("evidence", item.blob, `${item.fileId}.enc`);
+        }
+
+        // 4. Send ONLY ciphertext envelope and encrypted evidence blobs to server
+        try {
+          const res = await fetch("/api/complaints", {
+            method: "POST",
+            body,
+          });
+          const json = (await res.json()) as Record<string, unknown>;
+
+          if (!res.ok) {
+            setServerError(
+              typeof json.error === "string"
+                ? json.error
+                : "Unable to submit encrypted report."
+            );
+            return;
+          }
+
+          setSuccessData({
+            complaintId: String(json.complaintId ?? complaintId),
+            caseCode: String(json.caseCode ?? ""),
+            recoverySecret: String(json.recoverySecret ?? ""),
+            evidenceCount: Number(json.evidenceCount ?? 0),
+            retentionUntil: String(
+              json.retentionUntil ??
+                new Date(
+                  Date.now() + form.retentionDays * 86_400_000
+                ).toISOString()
+            ),
+            submittedAt: new Date().toISOString(),
+            evidenceHashes,
+          });
+          setForm(INITIAL_STATE);
+          setFiles([]);
+        } catch (err) {
+          setServerError(
+            `Encrypted report could not be delivered to the server (${err instanceof Error ? err.message : "network error"}). Please try again.`
+          );
         }
       } catch (err) {
         // Never fall back to unencrypted or server-side submission
@@ -221,37 +289,6 @@ export function ReportForm() {
           `Client-side encryption failed in your browser (${err instanceof Error ? err.message : "Web Crypto error"}). No complaint data was transmitted.`
         );
         return;
-      }
-
-      // 4. Send ONLY ciphertext envelope and encrypted evidence blobs to server
-      try {
-        const res = await fetch("/api/complaints", {
-          method: "POST",
-          body,
-        });
-        const json = (await res.json()) as Record<string, unknown>;
-
-        if (!res.ok) {
-          setServerError(
-            typeof json.error === "string"
-              ? json.error
-              : "Unable to submit encrypted report."
-          );
-          return;
-        }
-
-        setSuccessData({
-          complaintId: String(json.complaintId ?? complaintId),
-          caseCode: String(json.caseCode ?? ""),
-          recoverySecret: String(json.recoverySecret ?? ""),
-          evidenceCount: Number(json.evidenceCount ?? 0),
-        });
-        setForm(INITIAL_STATE);
-        setFiles([]);
-      } catch (err) {
-        setServerError(
-          `Encrypted report could not be delivered to the server (${err instanceof Error ? err.message : "network error"}). Please try again.`
-        );
       }
     } finally {
       setIsSubmitting(false);
@@ -341,13 +378,67 @@ export function ReportForm() {
               </div>
             </div>
 
-            <p className="text-xs text-slate-500">
-              Encrypted evidence files stored: {successData.evidenceCount}
-            </p>
+            <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4 text-xs text-slate-600">
+              <p>
+                <span className="font-semibold text-slate-900">
+                  Encrypted evidence files stored:
+                </span>{" "}
+                {successData.evidenceCount}
+              </p>
+              <p className="mt-1">
+                <span className="font-semibold text-slate-900">
+                  Evidence Auto-Shred Date:
+                </span>{" "}
+                {new Date(successData.retentionUntil).toLocaleDateString()}
+              </p>
+            </div>
 
-            <Button type="button" variant="outline" onClick={handleReset}>
-              Submit Another Anonymous Report
-            </Button>
+            <div className="flex flex-wrap gap-3">
+              <Button
+                type="button"
+                variant="primary"
+                onClick={() => {
+                  const receiptLines = [
+                    "AWAAZ — ZERO-KNOWLEDGE SUBMISSION RECEIPT",
+                    "==========================================",
+                    `Case ID (Status Tracking): ${successData.caseCode}`,
+                    `Recovery Secret (Follow-Up): ${successData.recoverySecret}`,
+                    `Internal Envelope UUID: ${successData.complaintId}`,
+                    `Submitted At (UTC): ${successData.submittedAt}`,
+                    `Auto-Shred Retention Until: ${successData.retentionUntil}`,
+                    `Encryption Scheme: AES-256-GCM + 2-of-N Shamir + RSA-OAEP-256`,
+                    `Encrypted Evidence Count: ${successData.evidenceCount}`,
+                    ...(successData.evidenceHashes.length > 0
+                      ? [
+                          "",
+                          "Encrypted Evidence SHA-256 Hashes:",
+                          ...successData.evidenceHashes.map(
+                            (e) => `- ${e.fileId}: ${e.sha256}`
+                          ),
+                        ]
+                      : []),
+                    "",
+                    "Keep this file offline. Only SHA-256 hashes of your Case ID",
+                    "and Recovery Secret are stored on Awaaz servers.",
+                  ].join("\n");
+                  const blob = new Blob([receiptLines], {
+                    type: "text/plain;charset=utf-8",
+                  });
+                  const url = URL.createObjectURL(blob);
+                  const link = document.createElement("a");
+                  link.href = url;
+                  link.download = `awaaz-receipt-${successData.caseCode}.txt`;
+                  link.click();
+                  URL.revokeObjectURL(url);
+                }}
+              >
+                <Download className="h-4 w-4" />
+                Download Receipt (.txt)
+              </Button>
+              <Button type="button" variant="outline" onClick={handleReset}>
+                Submit Another Anonymous Report
+              </Button>
+            </div>
           </div>
         ) : (
           <form onSubmit={handleSubmit} className="space-y-6" noValidate>
@@ -396,6 +487,30 @@ export function ReportForm() {
                 </Select>
               </FormField>
             </div>
+
+            <FormField
+              id="retentionDays"
+              label="Evidence Auto-Shred Policy"
+              hint="Encrypted evidence blobs are automatically shredded after this window while preserving deletion audit receipts."
+            >
+              <Select
+                id="retentionDays"
+                value={String(form.retentionDays)}
+                onChange={(e) =>
+                  setForm((prev) => ({
+                    ...prev,
+                    retentionDays: Number.parseInt(e.target.value, 10) || 90,
+                  }))
+                }
+                disabled={isSubmitting}
+              >
+                {RETENTION_POLICY_OPTIONS.map((option) => (
+                  <option key={option.days} value={String(option.days)}>
+                    {option.label}
+                  </option>
+                ))}
+              </Select>
+            </FormField>
 
             <div className="grid gap-5 sm:grid-cols-2">
               <FormField

@@ -7,6 +7,8 @@ import {
   forwardShareInBrowser,
   importRsaOaepPrivateKeyNonExtractable,
   reconstructAndDecryptComplaintInBrowser,
+  reconstructAndDecryptEvidenceInBrowser,
+  validateEvidenceBytesSignature,
   verifyPrivateKeyMatchesPublicKeyInBrowser,
 } from "../src/lib/security/client-crypto.ts";
 import {
@@ -341,4 +343,104 @@ test("Evidence encryption hides plaintext bytes and tracking credentials hash cl
   assert.match(creds.caseCode, /^AWZ-[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$/);
   assert.equal(creds.caseCodeHash.length, 64);
   assert.equal(creds.recoverySecretHash.length, 64);
+});
+
+test("C2: Browser AWZ1 evidence forwarding and 2-of-N decryption round-trip", async () => {
+  const mA = makeMember("11111111-1111-1111-1111-111111111111");
+  const mB = makeMember("22222222-2222-2222-2222-222222222222");
+  const complaintId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const fileId = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+  const rawEvidence = new TextEncoder().encode("CONFIDENTIAL_EVIDENCE_PAYLOAD");
+
+  const enc = await encryptEvidenceBytesInBrowser({
+    fileBytes: rawEvidence,
+    mimeType: "text/plain",
+    complaintId,
+    fileId,
+    recipients: [
+      { memberId: mA.id, publicKey: mA.publicKey },
+      { memberId: mB.id, publicKey: mB.publicKey },
+    ],
+  });
+
+  const buf = Buffer.from(enc.encryptedBytes);
+  const headerLen = buf.readUInt32BE(4);
+  const header = JSON.parse(buf.subarray(8, 8 + headerLen).toString("utf8")) as {
+    iv: string;
+    authTag: string;
+    shares: Record<string, string>;
+  };
+  const ciphertextBase64 = buf.subarray(8 + headerLen).toString("base64");
+
+  const keyA = await importRsaOaepPrivateKeyNonExtractable(mA.privateKey);
+  const keyB = await importRsaOaepPrivateKeyNonExtractable(mB.privateKey);
+
+  const forwardedShare = await forwardShareInBrowser({
+    myEncryptedShareBase64: header.shares[mA.id],
+    myPrivateKey: keyA,
+    recipientPublicKeyPem: mB.publicKey,
+  });
+
+  const dec = await reconstructAndDecryptEvidenceInBrowser({
+    complaintId,
+    fileId,
+    ivBase64: header.iv,
+    authTagBase64: header.authTag,
+    ciphertextBase64,
+    myEncryptedShareBase64: header.shares[mB.id],
+    forwardedEncryptedSharesBase64: [forwardedShare],
+    myPrivateKey: keyB,
+  });
+
+  assert.equal(dec.reconstructedKeyHexLength, 64);
+  assert.deepEqual(dec.fileBytes, rawEvidence);
+
+  await assert.rejects(() =>
+    reconstructAndDecryptEvidenceInBrowser({
+      complaintId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      fileId,
+      ivBase64: header.iv,
+      authTagBase64: header.authTag,
+      ciphertextBase64,
+      myEncryptedShareBase64: header.shares[mB.id],
+      forwardedEncryptedSharesBase64: [forwardedShare],
+      myPrivateKey: keyB,
+    })
+  );
+});
+
+test("Magic-byte evidence validation accepts valid headers and rejects spoofed bytes", () => {
+  assert.equal(
+    validateEvidenceBytesSignature(
+      new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]),
+      "image/png"
+    ).ok,
+    true
+  );
+  assert.equal(
+    validateEvidenceBytesSignature(
+      new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37]),
+      "application/pdf"
+    ).ok,
+    true
+  );
+  assert.equal(
+    validateEvidenceBytesSignature(
+      new TextEncoder().encode("Valid incident statement"),
+      "text/plain"
+    ).ok,
+    true
+  );
+  // Spoofed executable disguised as PNG must be rejected
+  assert.equal(
+    validateEvidenceBytesSignature(
+      new TextEncoder().encode("MZ_NOT_A_PNG"),
+      "image/png"
+    ).ok,
+    false
+  );
+  assert.equal(
+    validateEvidenceBytesSignature(new Uint8Array([0x00, 0x01, 0x02]), "text/plain").ok,
+    false
+  );
 });

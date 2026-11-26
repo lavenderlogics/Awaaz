@@ -15,7 +15,7 @@ import {
  * for browser-side 2-of-N encryption. Never returns private keys or member PII.
  */
 export async function GET(request: Request) {
-  const rate = checkRateLimit(
+  const rate = await checkRateLimit(
     getRateLimitClientKey(request.headers, "committee-public-keys"),
     { limit: 60, windowMs: 10 * 60_000 }
   );

@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { invalidateDashboardCache } from "@/lib/redis/client";
 import { appendAuditLog } from "@/lib/security/audit";
 import {
   isValidRsaPublicKeyPem,
@@ -27,7 +28,7 @@ import { EVIDENCE_BUCKET_NAME } from "@/lib/supabase/health";
  * Never receives or encrypts raw unencrypted evidence bytes on the server.
  */
 export async function POST(request: Request) {
-  const rate = checkRateLimit(
+  const rate = await checkRateLimit(
     getRateLimitClientKey(request.headers, "upload-evidence"),
     { limit: 10, windowMs: 10 * 60_000 }
   );
@@ -195,17 +196,20 @@ export async function POST(request: Request) {
     );
   }
 
-  await appendAuditLog(admin, {
-    complaintId: complaint.id,
-    actorMemberId: null,
-    eventType: "EVIDENCE_UPLOADED",
-    eventDetails: {
-      evidenceFileId: fileId,
-      mimeType: rawMimeType,
-      encryptedSize: encryptedBytes.length,
-      clientEncrypted: true,
-    },
-  });
+  await Promise.all([
+    appendAuditLog(admin, {
+      complaintId: complaint.id,
+      actorMemberId: null,
+      eventType: "EVIDENCE_UPLOADED",
+      eventDetails: {
+        evidenceFileId: fileId,
+        mimeType: rawMimeType,
+        encryptedSize: encryptedBytes.length,
+        clientEncrypted: true,
+      },
+    }),
+    invalidateDashboardCache(),
+  ]);
 
   return NextResponse.json(
     {

@@ -59,48 +59,88 @@ export function computeAuditEntryHash(input: {
   );
 }
 
-/** Appends a hash-chained audit log record to `audit_logs` using the server-only admin client. */
+let auditAppendQueue: Promise<unknown> = Promise.resolve();
+
+async function appendAuditLogAttempt(
+  admin: SupabaseClient,
+  entry: AuditLogInsert
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const { data: latestRow, error: latestError } = await admin
+      .from("audit_logs")
+      .select("id, entry_hash")
+      .order("id", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (latestError) {
+      return { ok: false, error: latestError.message };
+    }
+
+    const previousHash = latestRow?.entry_hash ?? "GENESIS";
+    const createdAt = new Date().toISOString();
+    const entryHash = computeAuditEntryHash({
+      previousHash,
+      complaintId: entry.complaintId,
+      actorMemberId: entry.actorMemberId,
+      eventType: entry.eventType,
+      eventDetails: entry.eventDetails,
+      createdAt,
+    });
+
+    const { data: inserted, error: insertError } = await admin
+      .from("audit_logs")
+      .insert({
+        complaint_id: entry.complaintId,
+        actor_member_id: entry.actorMemberId,
+        event_type: entry.eventType,
+        event_details: entry.eventDetails,
+        previous_hash: previousHash,
+        entry_hash: entryHash,
+        created_at: createdAt,
+      })
+      .select("id, previous_hash")
+      .single();
+
+    if (insertError) {
+      return { ok: false, error: insertError.message };
+    }
+
+    // Detect cross-instance race condition: confirm the row immediately before ours matches previousHash.
+    const { data: priorRow } = await admin
+      .from("audit_logs")
+      .select("entry_hash")
+      .lt("id", inserted.id)
+      .order("id", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const expectedPriorHash = priorRow?.entry_hash ?? "GENESIS";
+    if (expectedPriorHash === inserted.previous_hash) {
+      return { ok: true };
+    }
+
+    // Remove forked row and retry against the updated chain tip.
+    await admin.from("audit_logs").delete().eq("id", inserted.id);
+  }
+
+  return {
+    ok: false,
+    error: "Audit log append conflicted with concurrent updates.",
+  };
+}
+
+/** Appends a serialized hash-chained audit log record to `audit_logs` using the server-only admin client. */
 export async function appendAuditLog(
   admin: SupabaseClient,
   entry: AuditLogInsert
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  const { data: latestRow, error: latestError } = await admin
-    .from("audit_logs")
-    .select("entry_hash")
-    .order("id", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (latestError) {
-    return { ok: false, error: latestError.message };
-  }
-
-  const previousHash = latestRow?.entry_hash ?? "GENESIS";
-  const createdAt = new Date().toISOString();
-  const entryHash = computeAuditEntryHash({
-    previousHash,
-    complaintId: entry.complaintId,
-    actorMemberId: entry.actorMemberId,
-    eventType: entry.eventType,
-    eventDetails: entry.eventDetails,
-    createdAt,
-  });
-
-  const { error: insertError } = await admin.from("audit_logs").insert({
-    complaint_id: entry.complaintId,
-    actor_member_id: entry.actorMemberId,
-    event_type: entry.eventType,
-    event_details: entry.eventDetails,
-    previous_hash: previousHash,
-    entry_hash: entryHash,
-    created_at: createdAt,
-  });
-
-  if (insertError) {
-    return { ok: false, error: insertError.message };
-  }
-
-  return { ok: true };
+  const run = auditAppendQueue.then(
+    () => appendAuditLogAttempt(admin, entry),
+    () => appendAuditLogAttempt(admin, entry)
+  );
+  auditAppendQueue = run.catch(() => undefined);
+  return run;
 }
 
 /** Verifies linkage (`previous_hash`) and `entry_hash` across ascending audit log rows. */

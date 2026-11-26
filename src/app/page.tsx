@@ -4,8 +4,11 @@ import {
   ClipboardList,
   EyeOff,
   FileSearch,
+  KeyRound,
   Lock,
+  PhoneCall,
   Shield,
+  ShieldAlert,
   ShieldCheck,
   Users,
 } from "lucide-react";
@@ -24,42 +27,66 @@ import { StatusNotice } from "@/components/ui/StatusNotice";
 const ARCHITECTURE_PILLARS = [
   {
     icon: EyeOff,
-    title: "Minimal Identity Intake",
+    title: "Zero-Identity Browser Intake",
     description:
-      "The student reporting flow is structured so complaints can be filed without collecting names, roll numbers, or personal phone numbers.",
+      "Complaints and attached evidence are encrypted locally with AES-256-GCM inside your browser without requiring student login, names, or roll numbers.",
   },
   {
     icon: FileSearch,
-    title: "Case-ID Status Tracking",
+    title: "Hash-Only Case Tracking",
     description:
-      "Designed around a standalone reference Case ID so students can follow committee review stages without maintaining a student account.",
+      "Your Case ID and Recovery Secret are stored solely as SHA-256 hashes so you can track review progress and upload encrypted follow-up evidence anonymously.",
   },
   {
     icon: Lock,
-    title: "Role-Separated Committee Access",
+    title: "2-of-N Committee Threshold",
     description:
-      "A dedicated login and triage dashboard separates public reporting routes from authorized anti-ragging committee workflows.",
+      "Decryption keys are split via Shamir Secret Sharing over GF(256). No server admin or single committee officer can ever unlock a complaint alone.",
   },
 ];
 
 const WORKFLOW_STEPS = [
   {
     step: "01",
-    title: "Document the Incident",
+    icon: ClipboardList,
+    title: "Encrypt & Submit Anonymously",
     description:
-      "Select the category, campus location, date, and factual description using the structured anonymous intake form.",
+      "Document the incident and attach files. Your browser encrypts everything with AES-256-GCM and splits the key across committee public keys before upload.",
   },
   {
     step: "02",
-    title: "Retain Your Case ID",
+    icon: KeyRound,
+    title: "Save Your Case ID & Secret",
     description:
-      "Each submission issues a unique Case ID and Recovery Secret (stored only as SHA-256 hashes) for anonymous follow-up status checks.",
+      "Download your local receipt containing your unique Case ID and Recovery Secret (stored only as cryptographic hashes) for private follow-up.",
   },
   {
     step: "03",
-    title: "Committee Review & Updates",
+    icon: Users,
+    title: "Two-Officer Verification & Action",
     description:
-      "Authorized committee officers approve threshold share forwarding, reconstruct the key inside their browser, and post Case ID status updates.",
+      "Two authorized committee officers forward encrypted Shamir shares inside their browsers, decrypt locally, and post Case ID status updates.",
+  },
+];
+
+const EMERGENCY_CHANNELS = [
+  {
+    title: "UGC Anti-Ragging Helpline",
+    contact: "1800-180-5522",
+    href: "tel:18001805522",
+    detail: "24x7 toll-free national helpline for immediate ragging intervention.",
+  },
+  {
+    title: "Emergency Police & Medical",
+    contact: "112",
+    href: "tel:112",
+    detail: "Call immediately if anyone faces physical danger or urgent medical risk.",
+  },
+  {
+    title: "Campus Security & Counseling",
+    contact: "24x7 Campus Desk",
+    href: "/report",
+    detail: "Contact your hostel warden or campus security first, then file on Awaaz.",
   },
 ];
 
@@ -92,12 +119,27 @@ export default function HomePage() {
 
               <div className="flex flex-wrap items-center gap-3.5 pt-1">
                 <LinkButton href="/report" variant="primary" size="lg">
-                  Submit Anonymous Report
+                  Report Anonymously
                   <ArrowRight className="h-4 w-4" />
                 </LinkButton>
                 <LinkButton href="/track" variant="outline" size="lg">
-                  Track Case Status
+                  Track Complaint
                 </LinkButton>
+              </div>
+
+              <div className="flex flex-wrap gap-2 pt-1 text-xs text-slate-600">
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white/90 px-3 py-1 font-medium">
+                  <CheckCircle2 className="h-3.5 w-3.5 text-emerald-700" />
+                  Zero Student Login
+                </span>
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white/90 px-3 py-1 font-medium">
+                  <Lock className="h-3.5 w-3.5 text-navy-700" />
+                  AES-256-GCM in Browser
+                </span>
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white/90 px-3 py-1 font-medium">
+                  <KeyRound className="h-3.5 w-3.5 text-navy-700" />
+                  2-of-N Shamir Split
+                </span>
               </div>
 
               <p className="text-xs leading-relaxed text-slate-500">
@@ -226,16 +268,71 @@ export default function HomePage() {
           />
 
           <div className="mt-12 grid gap-6 md:grid-cols-3">
-            {WORKFLOW_STEPS.map((item) => (
-              <Card key={item.step} className="bg-white">
-                <CardHeader>
-                  <span className="inline-flex w-fit rounded-lg bg-navy-900 px-2.5 py-1 font-mono text-xs font-semibold text-white">
-                    STEP {item.step}
-                  </span>
-                  <CardTitle className="mt-4">{item.title}</CardTitle>
-                  <CardDescription>{item.description}</CardDescription>
-                </CardHeader>
-              </Card>
+            {WORKFLOW_STEPS.map((item) => {
+              const StepIcon = item.icon;
+              return (
+                <Card key={item.step} className="relative bg-white">
+                  <CardHeader>
+                    <div className="flex items-center justify-between">
+                      <span className="inline-flex w-fit rounded-lg bg-navy-900 px-2.5 py-1 font-mono text-xs font-semibold text-white">
+                        STEP {item.step}
+                      </span>
+                      <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-navy-50 text-navy-800">
+                        <StepIcon className="h-4 w-4" />
+                      </span>
+                    </div>
+                    <CardTitle className="mt-4">{item.title}</CardTitle>
+                    <CardDescription>{item.description}</CardDescription>
+                  </CardHeader>
+                </Card>
+              );
+            })}
+          </div>
+        </div>
+      </section>
+
+      {/* Emergency Help Section */}
+      <section className="mx-auto max-w-6xl px-4 pt-14 sm:px-6 sm:pt-16 lg:px-8">
+        <div className="rounded-2xl border border-amber-200 bg-amber-50/60 p-6 sm:p-8">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-start gap-3">
+              <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-100 text-amber-800">
+                <ShieldAlert className="h-5 w-5" />
+              </span>
+              <div>
+                <p className="text-xs font-semibold tracking-wider text-amber-900 uppercase">
+                  Immediate Safety &amp; Emergency Support
+                </p>
+                <h2 className="mt-0.5 text-lg font-bold text-slate-950 sm:text-xl">
+                  Facing active intimidation or physical threat right now?
+                </h2>
+              </div>
+            </div>
+            <LinkButton href="/report" variant="outline" size="sm">
+              File Anonymous Report
+            </LinkButton>
+          </div>
+
+          <div className="mt-6 grid gap-4 md:grid-cols-3">
+            {EMERGENCY_CHANNELS.map((channel) => (
+              <a
+                key={channel.title}
+                href={channel.href}
+                className="block rounded-xl border border-amber-200/80 bg-white p-4 shadow-2xs transition hover:border-amber-300 hover:bg-amber-50/30"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-semibold tracking-wider text-slate-600 uppercase">
+                    {channel.title}
+                  </p>
+                  <PhoneCall className="h-4 w-4 text-amber-700" />
+                </div>
+                <p className="mt-1.5 font-mono text-lg font-bold text-navy-950">
+                  {channel.contact}
+                </p>
+                <p className="mt-1 text-xs leading-relaxed text-slate-600">
+                  {channel.detail}
+                </p>
+              </a>
             ))}
           </div>
         </div>

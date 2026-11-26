@@ -1,5 +1,10 @@
 import { NextResponse } from "next/server";
 import { mapUiCategoryToDbCategory } from "@/lib/constants";
+import {
+  enqueueBackgroundJob,
+  invalidateDashboardCache,
+  scheduleAutoShredJob,
+} from "@/lib/redis/client";
 import { appendAuditLog } from "@/lib/security/audit";
 import {
   ENCRYPTION_ALGORITHM,
@@ -16,6 +21,7 @@ import {
   isValidCategory,
   MAX_EVIDENCE_BYTES,
   MAX_EVIDENCE_FILES,
+  parseRetentionDays,
 } from "@/lib/security/validation";
 import { createAdminClient } from "@/lib/supabase/admin";
 import {
@@ -43,6 +49,7 @@ interface EvidenceMetadataInput {
 interface ParsedEncryptedSubmission {
   complaintId: unknown;
   category: unknown;
+  retentionDays: unknown;
   encryptedPayload: unknown;
   evidenceBlobs: File[];
   evidenceMeta: unknown;
@@ -85,6 +92,7 @@ async function parseSubmission(
     return {
       complaintId: formData.get("complaintId"),
       category: formData.get("category"),
+      retentionDays: formData.get("retentionDays"),
       encryptedPayload: parsedPayload,
       evidenceBlobs,
       evidenceMeta: parsedMeta,
@@ -100,6 +108,7 @@ async function parseSubmission(
   return {
     complaintId: body.complaintId,
     category: body.category,
+    retentionDays: body.retentionDays,
     encryptedPayload: body.encryptedPayload,
     evidenceBlobs: [],
     evidenceMeta: [],
@@ -113,7 +122,7 @@ async function parseSubmission(
  * Never receives plaintext descriptions, raw evidence files, or AES keys.
  */
 export async function POST(request: Request) {
-  const rate = checkRateLimit(
+  const rate = await checkRateLimit(
     getRateLimitClientKey(request.headers, "submit-complaint"),
     { limit: 5, windowMs: 10 * 60_000 }
   );
@@ -301,9 +310,10 @@ export async function POST(request: Request) {
   }
 
   const tracking = generateTrackingCredentials();
+  const retentionDays = parseRetentionDays(parsed.retentionDays, 90);
   const nowIso = new Date().toISOString();
   const retentionUntil = new Date(
-    Date.now() + 365 * 24 * 60 * 60 * 1000
+    Date.now() + retentionDays * 24 * 60 * 60 * 1000
   ).toISOString();
 
   const { error: insertError } = await admin.from("complaints").insert({
@@ -367,18 +377,29 @@ export async function POST(request: Request) {
     uploadedCount += 1;
   }
 
-  await appendAuditLog(admin, {
-    complaintId,
-    actorMemberId: null,
-    eventType: "COMPLAINT_SUBMITTED",
-    eventDetails: {
-      category: dbCategory,
-      encryptionAlgorithm: ENCRYPTION_ALGORITHM,
-      clientEncrypted: true,
-      evidenceCount: uploadedCount,
-      threshold: `${REQUIRED_UNLOCK_APPROVALS}-of-${Object.keys(envelopeCheck.envelope.shares).length}`,
-    },
-  });
+  await Promise.all([
+    appendAuditLog(admin, {
+      complaintId,
+      actorMemberId: null,
+      eventType: "COMPLAINT_SUBMITTED",
+      eventDetails: {
+        category: dbCategory,
+        encryptionAlgorithm: ENCRYPTION_ALGORITHM,
+        clientEncrypted: true,
+        evidenceCount: uploadedCount,
+        retentionDays,
+        retentionUntil,
+        threshold: `${REQUIRED_UNLOCK_APPROVALS}-of-${Object.keys(envelopeCheck.envelope.shares).length}`,
+      },
+    }),
+    scheduleAutoShredJob(complaintId, retentionUntil),
+    enqueueBackgroundJob({
+      type: "AUTO_SHRED_SCHEDULED",
+      complaintId,
+      payload: { retentionUntil, evidenceCount: uploadedCount },
+    }),
+    invalidateDashboardCache(),
+  ]);
 
   return NextResponse.json(
     {

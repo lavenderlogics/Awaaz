@@ -14,6 +14,26 @@ export const ALLOWED_EVIDENCE_MIME_TYPES = new Set([
   "text/plain",
 ]);
 
+export const RETENTION_POLICY_OPTIONS = [
+  { days: 30, label: "30 Days (Rapid Auto-Shred)" },
+  { days: 90, label: "90 Days (Standard Investigation Window)" },
+  { days: 365, label: "365 Days (Extended Compliance Archive)" },
+] as const;
+
+const ALLOWED_RETENTION_DAYS = new Set<number>(
+  RETENTION_POLICY_OPTIONS.map((option) => option.days)
+);
+
+export function parseRetentionDays(value: unknown, fallbackDays = 90): number {
+  const numeric =
+    typeof value === "number"
+      ? value
+      : typeof value === "string"
+        ? Number.parseInt(value.trim(), 10)
+        : Number.NaN;
+  return ALLOWED_RETENTION_DAYS.has(numeric) ? numeric : fallbackDays;
+}
+
 /** Basic server-side input sanitization and validation helpers. */
 
 export function readNonEmptyString(

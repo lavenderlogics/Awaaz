@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { NextResponse } from "next/server";
+import { invalidateDashboardCache } from "@/lib/redis/client";
 import { appendAuditLog } from "@/lib/security/audit";
 import { requireCommitteeMember } from "@/lib/security/committee-auth";
 import {
@@ -17,6 +18,8 @@ interface ForwardedShareEnvelope {
   complaintId: string;
   senderMemberId: string;
   recipients: Record<string, string>;
+  evidenceRecipients?: Record<string, Record<string, string>>;
+  followUpRecipients?: Record<string, Record<string, string>>;
 }
 
 const FORBIDDEN_SECRET_FIELDS = [
@@ -72,7 +75,7 @@ export async function GET(request: Request) {
   }
 
   const admin = createAdminClient();
-  const [complaintRes, approvalsRes, evidenceRes] = await Promise.all([
+  const [complaintRes, approvalsRes, evidenceRes, auditRes] = await Promise.all([
     admin
       .from("complaints")
       .select(
@@ -88,6 +91,18 @@ export async function GET(request: Request) {
       .from("evidence_files")
       .select("id, mime_type, file_size, file_hash, created_at")
       .eq("complaint_id", complaintId),
+    admin
+      .from("audit_logs")
+      .select("id, event_type, event_details, actor_member_id, created_at")
+      .eq("complaint_id", complaintId)
+      .in("event_type", [
+        "PRIORITY_UPDATED",
+        "CASE_ASSIGNED",
+        "REPORTER_FOLLOWUP_SENT",
+        "COMMITTEE_FOLLOWUP_NOTE",
+      ])
+      .order("id", { ascending: true })
+      .limit(100),
   ]);
 
   if (complaintRes.error || !complaintRes.data) {
@@ -121,6 +136,11 @@ export async function GET(request: Request) {
     forwardedToIds: string[];
   }> = [];
 
+  const forwardedFollowUpsByMessage: Record<
+    string,
+    Array<{ senderMemberId: string; ciphertextShare: string }>
+  > = {};
+
   for (const row of approvalsRes.data ?? []) {
     const parsed = parseForwardedShareEnvelope(row.encrypted_key_share);
     if (!parsed) {
@@ -151,6 +171,85 @@ export async function GET(request: Request) {
         approvedAt: row.approved_at,
       });
     }
+
+    const followMap = parsed.followUpRecipients?.[auth.member.user_id];
+    if (row.member_id !== auth.member.user_id && followMap && typeof followMap === "object") {
+      for (const [msgId, cipherShare] of Object.entries(followMap)) {
+        if (isStrictRsa2048CiphertextBase64(cipherShare)) {
+          forwardedFollowUpsByMessage[msgId] ??= [];
+          forwardedFollowUpsByMessage[msgId].push({
+            senderMemberId: row.member_id,
+            ciphertextShare: cipherShare,
+          });
+        }
+      }
+    }
+  }
+
+  let priority = "standard";
+  let assignedMemberId: string | null = null;
+  const committeeFollowUps: Array<{
+    id: number;
+    note: string;
+    actorMemberId: string | null;
+    createdAt: string;
+  }> = [];
+  const encryptedReporterFollowUps: Array<{
+    messageId: string;
+    sentAt: string;
+    envelope: {
+      version: 1;
+      algorithm: "AES-256-GCM";
+      keyScheme: "SSS-2-OF-N+RSA-OAEP-256";
+      iv: string;
+      authTag: string;
+      ciphertext: string;
+    };
+    myEncryptedShare: string | null;
+    forwardedSharesToMe: Array<{ senderMemberId: string; ciphertextShare: string }>;
+  }> = [];
+
+  for (const row of auditRes.data ?? []) {
+    const details = (row.event_details ?? {}) as Record<string, unknown>;
+    if (row.event_type === "PRIORITY_UPDATED" && typeof details.priority === "string") {
+      priority = details.priority;
+    } else if (row.event_type === "CASE_ASSIGNED") {
+      assignedMemberId =
+        typeof details.assigneeMemberId === "string"
+          ? details.assigneeMemberId
+          : null;
+    } else if (
+      row.event_type === "COMMITTEE_FOLLOWUP_NOTE" &&
+      typeof details.note === "string"
+    ) {
+      committeeFollowUps.push({
+        id: row.id,
+        note: details.note,
+        actorMemberId: row.actor_member_id,
+        createdAt: row.created_at,
+      });
+    } else if (
+      row.event_type === "REPORTER_FOLLOWUP_SENT" &&
+      typeof details.messageId === "string" &&
+      details.envelope &&
+      typeof details.envelope === "object"
+    ) {
+      const msgEnv = details.envelope as EncryptedComplaintEnvelope;
+      encryptedReporterFollowUps.push({
+        messageId: details.messageId,
+        sentAt: row.created_at,
+        envelope: {
+          version: msgEnv.version,
+          algorithm: msgEnv.algorithm,
+          keyScheme: msgEnv.keyScheme,
+          iv: msgEnv.iv,
+          authTag: msgEnv.authTag,
+          ciphertext: msgEnv.ciphertext,
+        },
+        myEncryptedShare: msgEnv.shares?.[auth.member.user_id] ?? null,
+        forwardedSharesToMe: forwardedFollowUpsByMessage[details.messageId] ?? [],
+      });
+    }
   }
 
   return NextResponse.json(
@@ -158,6 +257,8 @@ export async function GET(request: Request) {
       complaintId: complaintRes.data.id,
       category: complaintRes.data.category,
       status: complaintRes.data.status ?? "submitted",
+      priority,
+      assignedMemberId,
       encryptionAlgorithm:
         complaintRes.data.encryption_algorithm ?? "AES-256-GCM",
       createdAt: complaintRes.data.created_at,
@@ -174,6 +275,8 @@ export async function GET(request: Request) {
       forwardedSharesToMe,
       approvalSummaries,
       evidenceFiles: evidenceRes.data ?? [],
+      committeeFollowUps,
+      encryptedReporterFollowUps,
     },
     { headers: { "Cache-Control": "no-store" } }
   );
@@ -186,7 +289,7 @@ export async function GET(request: Request) {
  * or plaintext shares, and never decrypts anything on the server.
  */
 export async function POST(request: Request) {
-  const rate = checkRateLimit(
+  const rate = await checkRateLimit(
     getRateLimitClientKey(request.headers, "committee-share-forward"),
     { limit: 30, windowMs: 10 * 60_000 }
   );
@@ -307,6 +410,15 @@ export async function POST(request: Request) {
   }
 
   if (!envelope.shares?.[auth.member.user_id]) {
+    await appendAuditLog(admin, {
+      complaintId,
+      actorMemberId: auth.member.user_id,
+      eventType: "UNLOCK_ATTEMPT_FAILED",
+      eventDetails: {
+        action: "share_forward",
+        reasonCode: "missing_sender_share",
+      },
+    });
     return NextResponse.json(
       {
         error:
@@ -316,9 +428,87 @@ export async function POST(request: Request) {
     );
   }
 
+  let validEvidenceSharesForRecipient: Record<string, string> | undefined;
+  if (body.evidenceForwardedShares !== undefined) {
+    if (
+      !body.evidenceForwardedShares ||
+      typeof body.evidenceForwardedShares !== "object" ||
+      Array.isArray(body.evidenceForwardedShares)
+    ) {
+      return NextResponse.json(
+        { error: "evidenceForwardedShares must be a fileId-to-ciphertext map." },
+        { status: 400 }
+      );
+    }
+    validEvidenceSharesForRecipient = {};
+    for (const [fileId, cipher] of Object.entries(
+      body.evidenceForwardedShares as Record<string, unknown>
+    )) {
+      if (!isUuid(fileId) || !isStrictRsa2048CiphertextBase64(cipher)) {
+        return NextResponse.json(
+          { error: "Invalid encrypted evidence share format." },
+          { status: 400 }
+        );
+      }
+      validEvidenceSharesForRecipient[fileId] = cipher.trim();
+    }
+  }
+
+  let validFollowUpSharesForRecipient: Record<string, string> | undefined;
+  if (body.followUpForwardedShares !== undefined) {
+    if (
+      !body.followUpForwardedShares ||
+      typeof body.followUpForwardedShares !== "object" ||
+      Array.isArray(body.followUpForwardedShares)
+    ) {
+      return NextResponse.json(
+        { error: "followUpForwardedShares must be a messageId-to-ciphertext map." },
+        { status: 400 }
+      );
+    }
+    validFollowUpSharesForRecipient = {};
+    for (const [msgId, cipher] of Object.entries(
+      body.followUpForwardedShares as Record<string, unknown>
+    )) {
+      if (!isUuid(msgId) || !isStrictRsa2048CiphertextBase64(cipher)) {
+        return NextResponse.json(
+          { error: "Invalid encrypted follow-up share format." },
+          { status: 400 }
+        );
+      }
+      validFollowUpSharesForRecipient[msgId] = cipher.trim();
+    }
+  }
+
   const existingParsed = existingApprovalRes.data
     ? parseForwardedShareEnvelope(existingApprovalRes.data.encrypted_key_share)
     : null;
+
+  const updatedEvidenceRecipients = {
+    ...(existingParsed?.evidenceRecipients ?? {}),
+  };
+  if (
+    validEvidenceSharesForRecipient &&
+    Object.keys(validEvidenceSharesForRecipient).length > 0
+  ) {
+    updatedEvidenceRecipients[recipientMemberId] = {
+      ...(updatedEvidenceRecipients[recipientMemberId] ?? {}),
+      ...validEvidenceSharesForRecipient,
+    };
+  }
+
+  const updatedFollowUpRecipients = {
+    ...(existingParsed?.followUpRecipients ?? {}),
+  };
+  if (
+    validFollowUpSharesForRecipient &&
+    Object.keys(validFollowUpSharesForRecipient).length > 0
+  ) {
+    updatedFollowUpRecipients[recipientMemberId] = {
+      ...(updatedFollowUpRecipients[recipientMemberId] ?? {}),
+      ...validFollowUpSharesForRecipient,
+    };
+  }
 
   const updatedEnvelope: ForwardedShareEnvelope = {
     version: 2,
@@ -329,6 +519,12 @@ export async function POST(request: Request) {
       ...(existingParsed?.recipients ?? {}),
       [recipientMemberId]: encryptedForwardedShare,
     },
+    ...(Object.keys(updatedEvidenceRecipients).length > 0
+      ? { evidenceRecipients: updatedEvidenceRecipients }
+      : {}),
+    ...(Object.keys(updatedFollowUpRecipients).length > 0
+      ? { followUpRecipients: updatedFollowUpRecipients }
+      : {}),
   };
 
   const nowIso = new Date().toISOString();
@@ -350,16 +546,19 @@ export async function POST(request: Request) {
     );
   }
 
-  await appendAuditLog(admin, {
-    complaintId,
-    actorMemberId: auth.member.user_id,
-    eventType: "UNLOCK_APPROVED",
-    eventDetails: {
-      mode: "C2-client-forwarded",
-      recipientMemberId,
-      memberRole: auth.member.role,
-    },
-  });
+  await Promise.all([
+    appendAuditLog(admin, {
+      complaintId,
+      actorMemberId: auth.member.user_id,
+      eventType: "UNLOCK_APPROVED",
+      eventDetails: {
+        mode: "C2-client-forwarded",
+        recipientMemberId,
+        memberRole: auth.member.role,
+      },
+    }),
+    invalidateDashboardCache(),
+  ]);
 
   return NextResponse.json({
     ok: true,

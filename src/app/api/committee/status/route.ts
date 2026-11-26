@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { invalidateDashboardCache } from "@/lib/redis/client";
 import { appendAuditLog } from "@/lib/security/audit";
 import { requireCommitteeMember } from "@/lib/security/committee-auth";
 import { isUuid, isValidComplaintStatus } from "@/lib/security/validation";
@@ -38,12 +39,15 @@ export async function PATCH(request: Request) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 
-  await appendAuditLog(admin, {
-    complaintId,
-    actorMemberId: auth.member.user_id,
-    eventType: "STATUS_UPDATED",
-    eventDetails: { newStatus: status },
-  });
+  await Promise.all([
+    appendAuditLog(admin, {
+      complaintId,
+      actorMemberId: auth.member.user_id,
+      eventType: "STATUS_UPDATED",
+      eventDetails: { newStatus: status },
+    }),
+    invalidateDashboardCache(),
+  ]);
 
   return NextResponse.json({ ok: true, complaintId, status });
 }

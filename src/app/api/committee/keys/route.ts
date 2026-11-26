@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { invalidateDashboardCache } from "@/lib/redis/client";
 import { requireCommitteeMember } from "@/lib/security/committee-auth";
 import { isValidRsaPublicKeyPem } from "@/lib/security/crypto";
 import { createAdminClient } from "@/lib/supabase/admin";
@@ -39,6 +40,8 @@ export async function POST(request: Request) {
       { status: 500 }
     );
   }
+
+  await invalidateDashboardCache();
 
   return NextResponse.json({
     ok: true,
