@@ -43,6 +43,9 @@ export async function GET(request: Request) {
     if (!error) {
       return NextResponse.redirect(`${origin}${nextPath}`);
     }
+    if (error.message.toLowerCase().includes("code verifier")) {
+      return NextResponse.redirect(`${origin}/committee/login?verified=cross_device`);
+    }
     return NextResponse.redirect(
       `${origin}/committee/login?error=${encodeURIComponent(error.message)}`
     );

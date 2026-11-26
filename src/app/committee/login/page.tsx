@@ -14,13 +14,13 @@ export const metadata: Metadata = {
 };
 
 interface CommitteeLoginPageProps {
-  searchParams: Promise<{ error?: string }>;
+  searchParams: Promise<{ error?: string; verified?: string }>;
 }
 
 export default async function CommitteeLoginPage({
   searchParams,
 }: CommitteeLoginPageProps) {
-  const { error: callbackError } = await searchParams;
+  const { error: callbackError, verified } = await searchParams;
   const configured = isSupabaseConfigured();
   let userEmail: string | null = null;
 
@@ -49,6 +49,14 @@ export default async function CommitteeLoginPage({
 
       <section className="mx-auto max-w-4xl px-4 py-12 sm:px-6 sm:py-16 lg:px-8">
         <div className="mb-8 space-y-4">
+          {verified === "cross_device" ? (
+            <StatusNotice title="Email Verified — Please Sign In" variant="success">
+              Your verification link was opened on a different browser or
+              device, so automatic sign-in did not run here. Your email is
+              confirmed—sign in below with your email and password.
+            </StatusNotice>
+          ) : null}
+
           {callbackError ? (
             <StatusNotice title="Email Verification Issue" variant="warning">
               {callbackError}
