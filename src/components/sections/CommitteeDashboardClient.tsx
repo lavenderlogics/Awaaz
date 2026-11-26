@@ -180,6 +180,11 @@ export function CommitteeDashboardClient({
   const [unlockError, setUnlockError] = useState("");
   const [isUnlocking, setIsUnlocking] = useState(false);
   const [decrypted, setDecrypted] = useState<DecryptedDetails | null>(null);
+  const [updatingStatusId, setUpdatingStatusId] = useState<string | null>(null);
+  const [statusUpdateFeedback, setStatusUpdateFeedback] = useState<{
+    type: "success" | "error";
+    text: string;
+  } | null>(null);
 
   const syncLocalKeyFromIndexedDb = useCallback(
     async (member: CurrentCommitteeMember | null) => {
@@ -673,17 +678,51 @@ export function CommitteeDashboardClient({
   };
 
   const handleStatusChange = async (complaintId: string, status: string) => {
+    const previousComplaints = complaints;
+    const stageLabel =
+      PLANNED_CASE_STAGES.find((stage) => stage.id === status)?.label ?? status;
+
+    setUpdatingStatusId(complaintId);
+    setStatusUpdateFeedback(null);
+    setComplaints((prev) =>
+      prev.map((item) =>
+        item.id === complaintId ? { ...item, status } : item
+      )
+    );
+
     try {
       const res = await fetch("/api/committee/status", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ complaintId, status }),
       });
-      if (res.ok) {
-        await loadDashboard();
+      const json = (await res.json().catch(() => ({}))) as { error?: string };
+
+      if (!res.ok) {
+        setComplaints(previousComplaints);
+        setStatusUpdateFeedback({
+          type: "error",
+          text:
+            typeof json.error === "string"
+              ? json.error
+              : `Unable to update case status (HTTP ${res.status}).`,
+        });
+        return;
       }
+
+      setStatusUpdateFeedback({
+        type: "success",
+        text: `Case ${complaintId.slice(0, 8)}... updated to "${stageLabel}".`,
+      });
+      await loadDashboard();
     } catch {
-      // Ignore transient UI error; reload will reflect latest state.
+      setComplaints(previousComplaints);
+      setStatusUpdateFeedback({
+        type: "error",
+        text: "Network error while updating case status. Please try again.",
+      });
+    } finally {
+      setUpdatingStatusId(null);
     }
   };
 
@@ -854,6 +893,24 @@ export function CommitteeDashboardClient({
                 ))}
               </Select>
             </div>
+            {statusUpdateFeedback ? (
+              <div className="mt-4">
+                <StatusNotice
+                  title={
+                    statusUpdateFeedback.type === "success"
+                      ? "Case Status Updated"
+                      : "Status Update Failed"
+                  }
+                  variant={
+                    statusUpdateFeedback.type === "success"
+                      ? "success"
+                      : "warning"
+                  }
+                >
+                  {statusUpdateFeedback.text}
+                </StatusNotice>
+              </div>
+            ) : null}
           </CardHeader>
 
           <CardContent className="p-0">
@@ -898,6 +955,7 @@ export function CommitteeDashboardClient({
                         <td className="px-5 py-4">
                           <Select
                             value={row.status}
+                            disabled={updatingStatusId === row.id}
                             onChange={(e) =>
                               void handleStatusChange(row.id, e.target.value)
                             }
@@ -1299,9 +1357,53 @@ export function CommitteeDashboardClient({
 
             {decrypted && decrypted.complaintId === selectedComplaintId ? (
               <div className="space-y-3 rounded-xl border border-emerald-200 bg-emerald-50/40 p-4 text-sm text-slate-800">
-                <p className="font-semibold text-emerald-950">
-                  Decrypted Complaint Payload (Browser Memory Only)
-                </p>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="font-semibold text-emerald-950">
+                    Decrypted Complaint Payload (Browser Memory Only)
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <Select
+                      value={
+                        complaints.find((c) => c.id === decrypted.complaintId)
+                          ?.status ??
+                        unlockBundle?.status ??
+                        "submitted"
+                      }
+                      disabled={updatingStatusId === decrypted.complaintId}
+                      onChange={(e) =>
+                        void handleStatusChange(
+                          decrypted.complaintId,
+                          e.target.value
+                        )
+                      }
+                      className="h-8 w-40 bg-white py-1 text-xs"
+                      aria-label="Update selected case status"
+                    >
+                      {PLANNED_CASE_STAGES.map((stage) => (
+                        <option key={stage.id} value={stage.id}>
+                          {stage.label}
+                        </option>
+                      ))}
+                    </Select>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="primary"
+                      disabled={
+                        updatingStatusId === decrypted.complaintId ||
+                        (complaints.find((c) => c.id === decrypted.complaintId)
+                          ?.status ?? unlockBundle?.status) === "resolved"
+                      }
+                      onClick={() =>
+                        void handleStatusChange(decrypted.complaintId, "resolved")
+                      }
+                    >
+                      {updatingStatusId === decrypted.complaintId
+                        ? "Saving..."
+                        : "Mark Resolved"}
+                    </Button>
+                  </div>
+                </div>
                 <pre className="overflow-x-auto rounded-lg bg-white p-3 font-mono text-xs text-slate-800">
                   {JSON.stringify(decrypted.payload, null, 2)}
                 </pre>
