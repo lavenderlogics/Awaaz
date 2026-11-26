@@ -17,7 +17,16 @@ export async function GET(request: Request) {
   const code = requestUrl.searchParams.get("code");
   const tokenHash = requestUrl.searchParams.get("token_hash");
   const type = requestUrl.searchParams.get("type") as EmailOtpType | null;
+  const authErrorDescription = requestUrl.searchParams.get("error_description");
   const nextPath = sanitizeRedirectPath(requestUrl.searchParams.get("next"));
+
+  if (authErrorDescription) {
+    return NextResponse.redirect(
+      `${origin}/committee/login?error=${encodeURIComponent(
+        authErrorDescription
+      )}`
+    );
+  }
 
   if (!isSupabaseConfigured()) {
     return NextResponse.redirect(

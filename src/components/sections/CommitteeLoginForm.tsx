@@ -2,7 +2,7 @@
 
 import { ArrowRight, Eye, EyeOff, KeyRound, Lock, Mail, UserPlus } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { type FormEvent, useState } from "react";
+import { type FormEvent, useRef, useState } from "react";
 import { Button, LinkButton } from "@/components/ui/Button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { FormField, Input } from "@/components/ui/FormField";
@@ -15,12 +15,25 @@ interface CommitteeLoginFormProps {
   isConfigured: boolean;
 }
 
+const BASIC_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 function formatSupabaseAuthError(message: string): string {
-  const normalized = message.toLowerCase();
+  const safeMessage = message.trim() || "Authentication request failed.";
+  const normalized = safeMessage.toLowerCase();
+
   if (normalized.includes("rate limit")) {
-    return "Email sending rate limit exceeded on Supabase's built-in mailer. Wait about an hour before requesting another email, or ask the project admin to connect Custom SMTP / confirm the account in Supabase Auth.";
+    return `${safeMessage} — Supabase's email sending limit was exceeded. Wait before retrying or review your Custom SMTP rate limits in Supabase Auth.`;
   }
-  return message;
+
+  if (
+    normalized.includes("error sending confirmation email") ||
+    normalized.includes("error sending recovery email") ||
+    normalized.includes("error sending magic link")
+  ) {
+    return `${safeMessage} — Supabase Auth failed to deliver the email via its configured SMTP server. Check your Supabase Custom SMTP host, port, sender email, and Gmail App Password.`;
+  }
+
+  return safeMessage;
 }
 
 /** Committee authentication card supporting Sign In, Sign Up, and Password Reset. */
@@ -40,8 +53,11 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
   );
   const [resetSentTo, setResetSentTo] = useState<string | null>(null);
   const [resendMessage, setResendMessage] = useState("");
+  const submitLockRef = useRef(false);
+  const resendLockRef = useRef(false);
 
   const switchMode = (nextMode: AuthMode) => {
+    if (submitLockRef.current || resendLockRef.current) return;
     setMode(nextMode);
     setError("");
     setResendMessage("");
@@ -53,7 +69,8 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
     `${window.location.origin}/auth/callback?next=${encodeURIComponent(nextPath)}`;
 
   const handleResendVerification = async (targetEmail: string) => {
-    if (!isConfigured || !targetEmail.trim()) return;
+    if (!isConfigured || !targetEmail.trim() || resendLockRef.current) return;
+    resendLockRef.current = true;
     setIsResending(true);
     setResendMessage("");
     setError("");
@@ -62,7 +79,7 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
       const supabase = createClient();
       const { error: resendError } = await supabase.auth.resend({
         type: "signup",
-        email: targetEmail.trim(),
+        email: targetEmail.trim().toLowerCase(),
         options: {
           emailRedirectTo: getCallbackUrl(),
         },
@@ -73,7 +90,9 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
         return;
       }
 
-      setResendMessage(`Verification email resent to ${targetEmail.trim()}.`);
+      setResendMessage(
+        `Verification email resent to ${targetEmail.trim().toLowerCase()}.`
+      );
     } catch (err) {
       setError(
         err instanceof Error
@@ -81,12 +100,17 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
           : "Unable to resend verification email."
       );
     } finally {
+      resendLockRef.current = false;
       setIsResending(false);
     }
   };
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+
+    if (submitLockRef.current) {
+      return;
+    }
 
     if (!isConfigured) {
       setError(
@@ -95,9 +119,9 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
       return;
     }
 
-    const trimmedEmail = email.trim();
-    if (!trimmedEmail) {
-      setError("Please enter your institutional email.");
+    const trimmedEmail = email.trim().toLowerCase();
+    if (!trimmedEmail || !BASIC_EMAIL_PATTERN.test(trimmedEmail)) {
+      setError("Please enter a valid institutional email address.");
       return;
     }
 
@@ -126,6 +150,7 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
       }
     }
 
+    submitLockRef.current = true;
     setIsSubmitting(true);
 
     try {
@@ -207,6 +232,7 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
           : "Unable to connect to Supabase authentication."
       );
     } finally {
+      submitLockRef.current = false;
       setIsSubmitting(false);
     }
   };
