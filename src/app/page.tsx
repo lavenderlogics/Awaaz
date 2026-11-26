@@ -53,13 +53,13 @@ const WORKFLOW_STEPS = [
     step: "02",
     title: "Retain Your Case ID",
     description:
-      "Once backend persistence is connected, each submission will issue a unique Case ID for follow-up status checks.",
+      "Each submission issues a unique Case ID and Recovery Secret (stored only as SHA-256 hashes) for anonymous follow-up status checks.",
   },
   {
     step: "03",
     title: "Committee Review & Updates",
     description:
-      "Authorized campus committee officers review queued reports, initiate action, and post status updates by Case ID.",
+      "Authorized committee officers approve threshold share forwarding, reconstruct the key inside their browser, and post Case ID status updates.",
   },
 ];
 
@@ -77,7 +77,7 @@ export default function HomePage() {
                   <ShieldCheck className="h-3.5 w-3.5" />
                   Campus Anti-Ragging &amp; Safety Platform
                 </Badge>
-                <Badge variant="outline">Hackathon Setup v0.1</Badge>
+                <Badge variant="outline">Zero-Knowledge Encrypted</Badge>
               </div>
 
               <h1 className="text-4xl font-bold tracking-tight text-slate-950 sm:text-5xl lg:leading-[1.12]">
@@ -101,9 +101,10 @@ export default function HomePage() {
               </div>
 
               <p className="text-xs leading-relaxed text-slate-500">
-                Current scope: Initial Next.js frontend architecture. Supabase
-                database, authentication, and backend security controls will be
-                integrated in the next phase.
+                End-to-end browser security: reports and evidence are encrypted
+                in your browser with AES-256-GCM, split via 2-of-N Shamir Secret
+                Sharing, and decrypted solely inside authorized officers&apos;
+                browsers.
               </p>
             </div>
 
@@ -120,11 +121,11 @@ export default function HomePage() {
                           Platform Architecture
                         </CardTitle>
                         <p className="text-xs text-slate-500">
-                          Initial Route &amp; UI Overview
+                          Zero-Knowledge Security Overview
                         </p>
                       </div>
                     </div>
-                    <Badge variant="amber">UI Ready</Badge>
+                    <Badge variant="emerald">Encrypted Live</Badge>
                   </div>
                 </CardHeader>
                 <CardContent className="space-y-3.5 pt-5">
@@ -136,7 +137,7 @@ export default function HomePage() {
                           Anonymous Intake Form
                         </p>
                         <p className="text-xs text-slate-600">
-                          Structured incident reporting at /report
+                          Browser-side AES-256-GCM &amp; AWZ1 encryption at /report
                         </p>
                       </div>
                     </div>
@@ -151,7 +152,7 @@ export default function HomePage() {
                           Case Reference Lookup
                         </p>
                         <p className="text-xs text-slate-600">
-                          Lifecycle tracking shell at /track
+                          Hashed Case ID &amp; Recovery Secret tracking at /track
                         </p>
                       </div>
                     </div>
@@ -166,7 +167,7 @@ export default function HomePage() {
                           Committee Triage Workspace
                         </p>
                         <p className="text-xs text-slate-600">
-                          Auth &amp; queue views at /committee/*
+                          IndexedDB keys &amp; 2-of-N share forwarding at /committee/*
                         </p>
                       </div>
                     </div>
@@ -174,12 +175,12 @@ export default function HomePage() {
                   </div>
 
                   <StatusNotice
-                    title="Supabase Client &amp; Auth Connected"
+                    title="Supabase Auth, Storage &amp; Audit Connected"
                     variant="info"
                   >
-                    Committee authentication is wired via Supabase. Student
-                    report submission and Case ID lookup queries are ready to
-                    bind once table column definitions are mapped.
+                    Student reports are encrypted inside the browser before
+                    reaching PostgreSQL, backed by Supabase Auth, encrypted
+                    evidence storage, and SHA-256 hash-chained audit logs.
                   </StatusNotice>
                 </CardContent>
               </Card>
@@ -252,8 +253,8 @@ export default function HomePage() {
                 Report an incident or check your Case ID
               </CardTitle>
               <CardDescription>
-                Access the structured complaint form or preview how Case ID
-                status tracking works across review stages.
+                Submit an end-to-end encrypted complaint or check real-time Case
+                ID status updates across committee review stages.
               </CardDescription>
             </CardHeader>
             <CardContent className="flex flex-wrap gap-3">
@@ -275,8 +276,9 @@ export default function HomePage() {
                 Authorized Anti-Ragging Committee Portal
               </CardTitle>
               <CardDescription>
-                Inspect the committee sign-in experience and review queue layout
-                prepared for upcoming Supabase Auth integration.
+                Sign in with Supabase Auth to verify keys, forward threshold
+                Shamir shares, and decrypt complaints strictly inside your
+                browser.
               </CardDescription>
             </CardHeader>
             <CardContent className="flex flex-wrap gap-3">

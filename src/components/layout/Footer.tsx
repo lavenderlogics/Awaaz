@@ -34,9 +34,10 @@ export function Footer() {
               progress.
             </p>
             <p className="max-w-md text-xs leading-relaxed text-slate-500">
-              Supabase client and committee authentication are connected via
-              environment configuration. Client-side encryption is not claimed
-              in this setup.
+              End-to-end browser encryption active: complaints and evidence are
+              encrypted in-browser via Web Crypto (AES-256-GCM, RSA-OAEP-256,
+              and 2-of-N Shamir Secret Sharing), while committee private keys
+              stay non-extractable in IndexedDB.
             </p>
           </div>
 

@@ -22,44 +22,44 @@ import { StatusNotice } from "@/components/ui/StatusNotice";
 export const metadata: Metadata = {
   title: "About Awaaz",
   description:
-    "Learn about the Awaaz cybersecurity hackathon project, its mission, technology stack, and planned roadmap.",
+    "Learn about Awaaz, its zero-knowledge cryptographic architecture, technology stack, and live committee security workflow.",
 };
 
 const STACK_ITEMS = [
   {
     icon: Layers,
     name: "Next.js App Router & React",
-    detail: "Modular routing across student intake, case tracking, and committee views.",
+    detail: "Modular routing and API handlers across student intake, Case ID tracking, and committee triage.",
   },
   {
     icon: Code2,
-    name: "TypeScript & Tailwind CSS",
-    detail: "Strict type safety paired with a clean navy-and-white cybersecurity UI system.",
+    name: "TypeScript & Web Crypto API",
+    detail: "Strict type safety paired with browser-native AES-256-GCM, RSA-OAEP-256, 2-of-N Shamir sharing, and IndexedDB.",
   },
   {
     icon: Database,
-    name: "Supabase (Upcoming Phase)",
-    detail: "Planned for PostgreSQL persistence, committee authentication, and Row-Level Security.",
+    name: "Supabase & Hash-Chained Audit",
+    detail: "PostgreSQL ciphertext persistence, Supabase Auth for committee officers, private evidence buckets, and SHA-256 audit logs.",
   },
 ];
 
-const ROADMAP_PHASES = [
+const ARCHITECTURE_MODULES = [
   {
-    phase: "Phase 1 — Current Setup",
-    status: "Completed",
+    phase: "Browser-Side Complaint & Evidence Encryption",
+    status: "Live",
     items: [
-      "Next.js App Router, TypeScript, and Tailwind CSS architecture",
-      "Reusable UI component library, responsive Navbar, and Footer",
-      "All six core pages (/ , /report, /track, /committee/login, /committee/dashboard, /about)",
+      "Complaints encrypted in-browser with AES-256-GCM bound to complaint UUID AAD",
+      "DEK split via 2-of-N Shamir Secret Sharing over GF(256) and wrapped with committee RSA-OAEP-256 keys",
+      "AWZ1 encrypted evidence blobs and SHA-256 hashed Case ID / Recovery Secret credentials",
     ],
   },
   {
-    phase: "Phase 2 — Backend & Security Integration",
-    status: "Planned",
+    phase: "Threshold Committee Unlock & Audit Trail",
+    status: "Live",
     items: [
-      "Connect Supabase database schema for reports and Case ID status timelines",
-      "Configure Supabase Auth and Row-Level Security for committee roles",
-      "Implement server-side validation, rate limiting, and metadata minimization",
+      "Non-extractable RSA-OAEP private CryptoKeys persisted strictly inside browser IndexedDB",
+      "Co-approver encrypted share forwarding and in-browser AES-256 key reconstruction",
+      "Supabase Auth with committee role verification and tamper-evident SHA-256 audit logs",
     ],
   },
 ];
@@ -100,19 +100,21 @@ export default function AboutPage() {
               <div className="flex items-center gap-2 text-navy-800">
                 <ShieldCheck className="h-5 w-5" />
                 <CardTitle className="text-base">
-                  Honest Scope Statement
+                  Zero-Knowledge Security Guarantee
                 </CardTitle>
               </div>
             </CardHeader>
             <CardContent className="space-y-3 text-sm leading-relaxed text-slate-600">
               <p>
-                This repository currently contains only the{" "}
-                <strong className="text-slate-900">initial frontend setup</strong>.
+                Awaaz is{" "}
+                <strong className="text-slate-900">fully operational end-to-end</strong>{" "}
+                with live Supabase PostgreSQL storage, committee authentication,
+                and browser-native Web Crypto encryption.
               </p>
               <p>
-                Backend persistence, authentication, and cryptographic or
-                storage protections are intentionally left for the upcoming
-                Supabase integration phase and are not simulated with fake data.
+                Plaintext complaint narratives, raw evidence files, committee
+                private keys, decrypted Shamir shares, and reconstructed AES-256
+                keys never leave authorized browsers.
               </p>
             </CardContent>
           </Card>
@@ -122,7 +124,7 @@ export default function AboutPage() {
           <SectionHeader
             eyebrow="Technology"
             title="Core Platform Stack"
-            subtitle="Lean, maintainable tools chosen for rapid hackathon iteration and clean production scalability."
+            subtitle="Production cryptographic primitives paired with PostgreSQL persistence and strict API boundaries."
           />
           <div className="mt-8 grid gap-6 md:grid-cols-3">
             {STACK_ITEMS.map((item) => {
@@ -144,24 +146,24 @@ export default function AboutPage() {
 
         <div>
           <SectionHeader
-            eyebrow="Roadmap"
-            title="Development Milestones"
-            subtitle="Clear separation between the initial UI foundation and upcoming backend security work."
+            eyebrow="Security Controls"
+            title="Implemented Cryptographic Architecture"
+            subtitle="Every protection below is active across student complaint intake and committee dashboard decryption."
           />
           <div className="mt-8 grid gap-6 md:grid-cols-2">
-            {ROADMAP_PHASES.map((group) => (
+            {ARCHITECTURE_MODULES.map((group) => (
               <Card key={group.phase}>
                 <CardHeader className="border-b border-slate-100">
                   <div className="flex items-center justify-between">
                     <CardTitle className="flex items-center gap-2 text-base">
-                      {group.status === "Completed" ? (
+                      {group.status === "Live" ? (
                         <Shield className="h-4 w-4 text-navy-700" />
                       ) : (
                         <Workflow className="h-4 w-4 text-slate-500" />
                       )}
                       {group.phase}
                     </CardTitle>
-                    <span className="rounded-full bg-navy-50 px-2.5 py-0.5 text-xs font-semibold text-navy-900">
+                    <span className="rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-semibold text-emerald-800">
                       {group.status}
                     </span>
                   </div>
@@ -181,10 +183,11 @@ export default function AboutPage() {
           </div>
         </div>
 
-        <StatusNotice title="Ready for Next Milestone" variant="navy">
-          Once Supabase is provisioned, the next step is wiring server actions /
-          route handlers, Row-Level Security policies, and Case ID generation
-          into the existing components.
+        <StatusNotice title="Full Backend &amp; Cryptographic Pipeline Active" variant="navy">
+          All core routes (/, /report, /track, /committee/login,
+          /committee/dashboard, /about) are wired to live Supabase PostgreSQL
+          tables, private encrypted evidence buckets, SHA-256 audit logging, and
+          2-of-N browser-side threshold decryption.
         </StatusNotice>
       </section>
     </div>
