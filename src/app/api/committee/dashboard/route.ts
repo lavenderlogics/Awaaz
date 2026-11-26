@@ -222,13 +222,43 @@ export async function GET() {
     };
   });
 
-  const members = snapshot.membersRows.map((m) => ({
-    userId: m.user_id,
-    fullName: m.full_name,
-    role: m.role,
-    hasPublicKey: m.hasPublicKey,
-    isActive: m.is_active === true,
-  }));
+  const members = snapshot.membersRows
+    .filter((m) => m.is_active === true)
+    .map((m) => ({
+      userId: m.user_id,
+      fullName: m.full_name,
+      role: m.role,
+      hasPublicKey: m.hasPublicKey,
+      isActive: true,
+    }));
+
+  let pendingMembers: Array<{
+    userId: string;
+    fullName: string;
+    email: string | null;
+    role: string;
+  }> = [];
+
+  if (auth.member.role === "admin") {
+    const pendingRows = snapshot.membersRows.filter((m) => m.is_active !== true);
+    if (pendingRows.length > 0) {
+      const admin = createAdminClient();
+      const { data: usersPage } = await admin.auth.admin.listUsers({
+        page: 1,
+        perPage: 200,
+      });
+      const emailById = new Map<string, string>();
+      for (const u of usersPage?.users ?? []) {
+        if (u.email) emailById.set(u.id, u.email);
+      }
+      pendingMembers = pendingRows.map((m) => ({
+        userId: m.user_id,
+        fullName: m.full_name,
+        email: emailById.get(m.user_id) ?? null,
+        role: m.role,
+      }));
+    }
+  }
 
   return NextResponse.json(
     {
@@ -240,6 +270,7 @@ export async function GET() {
         publicKeyPem: auth.member.public_key,
       },
       members,
+      pendingMembers,
       complaints,
     },
     {

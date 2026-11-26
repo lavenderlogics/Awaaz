@@ -72,6 +72,13 @@ interface CommitteeMemberSummary {
   isActive: boolean;
 }
 
+interface PendingMemberSummary {
+  userId: string;
+  fullName: string;
+  email: string | null;
+  role: string;
+}
+
 interface CurrentCommitteeMember extends CommitteeMemberSummary {
   publicKeyPem: string | null;
 }
@@ -193,6 +200,11 @@ export function CommitteeDashboardClient({
   const [apiError, setApiError] = useState("");
   const [complaints, setComplaints] = useState<DashboardComplaint[]>([]);
   const [members, setMembers] = useState<CommitteeMemberSummary[]>([]);
+  const [pendingMembers, setPendingMembers] = useState<PendingMemberSummary[]>(
+    []
+  );
+  const [pendingNotice, setPendingNotice] = useState("");
+  const [requestingAccess, setRequestingAccess] = useState(false);
   const [currentMember, setCurrentMember] =
     useState<CurrentCommitteeMember | null>(null);
 
@@ -292,22 +304,55 @@ export function CommitteeDashboardClient({
     if (!userEmail || !isServiceRoleReady) return;
 
     try {
-      const [dashRes, auditRes] = await Promise.all([
+      let [dashRes, auditRes] = await Promise.all([
         fetch("/api/committee/dashboard", { cache: "no-store" }),
         fetch("/api/committee/audit-logs", { cache: "no-store" }),
       ]);
-      const dashJson = (await dashRes.json()) as Record<string, unknown>;
+      let dashJson = (await dashRes.json()) as Record<string, unknown>;
+
+      if (!dashRes.ok && dashRes.status === 403) {
+        try {
+          const reqRes = await fetch("/api/committee/access-request", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+          });
+          const reqJson = (await reqRes.json()) as {
+            status?: string;
+            emailSent?: boolean;
+            emailConfigured?: boolean;
+          };
+          if (reqJson.status === "active") {
+            [dashRes, auditRes] = await Promise.all([
+              fetch("/api/committee/dashboard", { cache: "no-store" }),
+              fetch("/api/committee/audit-logs", { cache: "no-store" }),
+            ]);
+            dashJson = (await dashRes.json()) as Record<string, unknown>;
+          } else if (reqJson.status === "pending") {
+            setPendingNotice(
+              reqJson.emailSent
+                ? "An authorization confirmation email has been sent to the committee administrator(s)."
+                : reqJson.emailConfigured
+                  ? "Your access request is queued for administrator approval."
+                  : "Your access request is queued in the Admin Pending Approvals list (configure RESEND_API_KEY for instant admin email alerts)."
+            );
+          }
+        } catch {
+          // Keep existing error state if notification fails.
+        }
+      }
 
       if (!dashRes.ok) {
-        setApiError(
+        const msg =
           typeof dashJson.error === "string"
             ? dashJson.error
-            : "Failed to load committee dashboard."
-        );
+            : "Failed to load committee dashboard.";
+        setApiError(msg);
         return;
       }
 
       setApiError("");
+      setPendingNotice("");
       setComplaints(
         Array.isArray(dashJson.complaints)
           ? (dashJson.complaints as DashboardComplaint[])
@@ -316,6 +361,11 @@ export function CommitteeDashboardClient({
       setMembers(
         Array.isArray(dashJson.members)
           ? (dashJson.members as CommitteeMemberSummary[])
+          : []
+      );
+      setPendingMembers(
+        Array.isArray(dashJson.pendingMembers)
+          ? (dashJson.pendingMembers as PendingMemberSummary[])
           : []
       );
       const memberData =
@@ -987,6 +1037,68 @@ export function CommitteeDashboardClient({
     }
   };
 
+  const handleResendAdminApproval = async () => {
+    setRequestingAccess(true);
+    try {
+      const res = await fetch("/api/committee/access-request", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resendNotification: true }),
+      });
+      const json = (await res.json()) as {
+        emailSent?: boolean;
+        message?: string;
+        error?: string;
+      };
+      if (json.emailSent) {
+        setPendingNotice("Reminder email sent to active committee admin(s).");
+      } else {
+        setPendingNotice(
+          json.message ??
+            json.error ??
+            "Your request is queued for admin confirmation."
+        );
+      }
+    } finally {
+      setRequestingAccess(false);
+    }
+  };
+
+  const handlePendingDecision = async (
+    memberId: string,
+    decision: "approve_member" | "approve_admin" | "reject"
+  ) => {
+    setUpdatingMemberId(memberId);
+    try {
+      if (decision === "reject") {
+        const res = await fetch(
+          `/api/committee/members?memberId=${encodeURIComponent(memberId)}`,
+          { method: "DELETE" }
+        );
+        if (!res.ok) {
+          const json = (await res.json()) as { error?: string };
+          setApiError(json.error ?? "Unable to reject access request.");
+          return;
+        }
+      } else {
+        const role = decision === "approve_admin" ? "admin" : "member";
+        const res = await fetch("/api/committee/members", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ memberId, role, isActive: true }),
+        });
+        if (!res.ok) {
+          const json = (await res.json()) as { error?: string };
+          setApiError(json.error ?? "Unable to approve member.");
+          return;
+        }
+      }
+      await loadDashboard();
+    } finally {
+      setUpdatingMemberId(null);
+    }
+  };
+
   const handleMemberRoleChange = async (memberId: string, role: string) => {
     setUpdatingMemberId(memberId);
     try {
@@ -1133,12 +1245,38 @@ export function CommitteeDashboardClient({
           Variables (without <code className="font-mono">NEXT_PUBLIC_</code>).
         </StatusNotice>
       ) : apiError ? (
-        <StatusNotice title="Committee Access Notice" variant="warning">
-          <div className="space-y-2">
-            <p>{apiError}</p>
+        <StatusNotice title="Committee Access Pending" variant="warning">
+          <div className="space-y-3">
+            <p>
+              Signed in as <strong>{userEmail}</strong>.{" "}
+              {pendingNotice || apiError}
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={requestingAccess}
+                onClick={() => void handleResendAdminApproval()}
+              >
+                {requestingAccess
+                  ? "Sending Notification..."
+                  : "Notify Committee Admin"}
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                disabled={isSigningOut}
+                onClick={handleSignOut}
+              >
+                <LogOut className="h-3.5 w-3.5" />
+                Sign Out
+              </Button>
+            </div>
             {userId ? (
               <p className="text-xs">
-                Signed-in Supabase Auth UID:{" "}
+                Account UID:{" "}
                 <code className="rounded bg-amber-100 px-1.5 py-0.5 font-mono">
                   {userId}
                 </code>
@@ -1665,6 +1803,70 @@ export function CommitteeDashboardClient({
                     ) : null}
                   </div>
                 ) : null}
+              </div>
+            ) : null}
+
+            {currentMember?.role === "admin" && pendingMembers.length > 0 ? (
+              <div className="space-y-2 rounded-xl border border-amber-200 bg-amber-50/50 p-3 text-xs">
+                <p className="font-semibold text-amber-950">
+                  Pending Access Requests ({pendingMembers.length})
+                </p>
+                {pendingMembers.map((pending) => (
+                  <div
+                    key={pending.userId}
+                    className="space-y-2 rounded-lg border border-amber-200/80 bg-white p-2.5"
+                  >
+                    <div>
+                      <p className="font-semibold text-slate-900">
+                        {pending.fullName}
+                      </p>
+                      <p className="truncate text-[11px] text-slate-500">
+                        {pending.email ?? pending.userId}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="primary"
+                        disabled={updatingMemberId === pending.userId}
+                        onClick={() =>
+                          void handlePendingDecision(
+                            pending.userId,
+                            "approve_member"
+                          )
+                        }
+                      >
+                        Approve Officer
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={updatingMemberId === pending.userId}
+                        onClick={() =>
+                          void handlePendingDecision(
+                            pending.userId,
+                            "approve_admin"
+                          )
+                        }
+                      >
+                        Approve Admin
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        disabled={updatingMemberId === pending.userId}
+                        onClick={() =>
+                          void handlePendingDecision(pending.userId, "reject")
+                        }
+                      >
+                        Reject
+                      </Button>
+                    </div>
+                  </div>
+                ))}
               </div>
             ) : null}
 

@@ -216,6 +216,22 @@ export function CommitteeLoginForm({ isConfigured }: CommitteeLoginFormProps) {
         return;
       }
 
+      if (data.user) {
+        try {
+          await fetch("/api/committee/access-request", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              userId: data.user.id,
+              fullName: fullName.trim(),
+              email: trimmedEmail,
+            }),
+          });
+        } catch {
+          // Non-fatal: dashboard will also allow submitting/checking request after sign-in.
+        }
+      }
+
       if (data.session) {
         router.push("/committee/dashboard");
         router.refresh();

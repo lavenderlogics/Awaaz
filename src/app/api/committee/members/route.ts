@@ -101,3 +101,57 @@ export async function PATCH(request: Request) {
   await invalidateDashboardCache();
   return NextResponse.json({ ok: true, memberId: targetUserId, updates });
 }
+
+/** Admin-only endpoint to reject/remove a pending (`is_active !== true`) access request. */
+export async function DELETE(request: Request) {
+  const rate = await checkRateLimit(
+    getRateLimitClientKey(request.headers, "committee-members-reject"),
+    { limit: 20, windowMs: 10 * 60_000 }
+  );
+  if (!rate.allowed) {
+    return NextResponse.json(
+      { error: "Too many member management requests." },
+      { status: 429 }
+    );
+  }
+
+  const auth = await requireCommitteeMember();
+  if (!auth.ok) {
+    return auth.response;
+  }
+
+  if (auth.member.role !== "admin") {
+    return NextResponse.json(
+      { error: "Forbidden: Only committee admins may reject access requests." },
+      { status: 403 }
+    );
+  }
+
+  const memberId = new URL(request.url).searchParams.get("memberId")?.trim() ?? "";
+  if (!isUuid(memberId)) {
+    return NextResponse.json(
+      { error: "Valid memberId UUID query parameter is required." },
+      { status: 400 }
+    );
+  }
+  if (memberId === auth.member.user_id) {
+    return NextResponse.json(
+      { error: "Cannot delete your own active admin account." },
+      { status: 400 }
+    );
+  }
+
+  const admin = createAdminClient();
+  const { error } = await admin
+    .from("committee_members")
+    .delete()
+    .eq("user_id", memberId)
+    .neq("is_active", true);
+
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+
+  await invalidateDashboardCache();
+  return NextResponse.json({ ok: true, rejectedMemberId: memberId });
+}
