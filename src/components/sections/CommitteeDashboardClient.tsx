@@ -2,6 +2,7 @@
 
 import {
   CheckCircle2,
+  ChevronDown,
   ClipboardList,
   Clock,
   Download,
@@ -952,22 +953,28 @@ export function CommitteeDashboardClient({
                               : `${row.approvalCount} Shared`}
                           </Badge>
                         </td>
-                        <td className="px-5 py-4">
-                          <Select
-                            value={row.status}
-                            disabled={updatingStatusId === row.id}
-                            onChange={(e) =>
-                              void handleStatusChange(row.id, e.target.value)
-                            }
-                            className="h-8 py-1 text-xs"
-                            aria-label={`Update status for ${row.id}`}
-                          >
-                            {PLANNED_CASE_STAGES.map((stage) => (
-                              <option key={stage.id} value={stage.id}>
-                                {stage.label}
-                              </option>
-                            ))}
-                          </Select>
+                        <td className="px-5 py-4 align-middle">
+                          <div className="relative inline-flex w-full min-w-[10.5rem] max-w-[13rem] items-center sm:w-48">
+                            <Select
+                              value={row.status}
+                              disabled={updatingStatusId === row.id}
+                              onChange={(e) =>
+                                void handleStatusChange(row.id, e.target.value)
+                              }
+                              className="h-11 w-full appearance-none !py-2.5 !pr-11 !pl-4 text-sm font-medium"
+                              aria-label={`Update status for ${row.id}`}
+                            >
+                              {PLANNED_CASE_STAGES.map((stage) => (
+                                <option key={stage.id} value={stage.id}>
+                                  {stage.label}
+                                </option>
+                              ))}
+                            </Select>
+                            <ChevronDown
+                              className="pointer-events-none absolute top-1/2 right-3.5 h-5 w-5 -translate-y-1/2 text-slate-600"
+                              aria-hidden="true"
+                            />
+                          </div>
                         </td>
                         <td className="px-5 py-4">
                           <Button
