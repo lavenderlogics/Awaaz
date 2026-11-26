@@ -384,7 +384,7 @@ export async function POST(request: Request) {
   if (
     recipientRes.error ||
     !recipientRes.data ||
-    recipientRes.data.is_active === false ||
+    recipientRes.data.is_active !== true ||
     !recipientRes.data.public_key ||
     !isValidRsaPublicKeyPem(recipientRes.data.public_key)
   ) {

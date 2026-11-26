@@ -227,7 +227,7 @@ export async function GET() {
     fullName: m.full_name,
     role: m.role,
     hasPublicKey: m.hasPublicKey,
-    isActive: m.is_active !== false,
+    isActive: m.is_active === true,
   }));
 
   return NextResponse.json(

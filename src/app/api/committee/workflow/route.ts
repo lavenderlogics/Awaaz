@@ -119,7 +119,7 @@ export async function POST(request: Request) {
         .select("user_id, is_active")
         .eq("user_id", assigneeMemberId)
         .maybeSingle();
-      if (!targetMember || targetMember.is_active === false) {
+      if (!targetMember || targetMember.is_active !== true) {
         return NextResponse.json(
           { error: "Selected assignee is not an active committee member." },
           { status: 400 }

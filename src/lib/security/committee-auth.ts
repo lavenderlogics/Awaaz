@@ -75,7 +75,7 @@ export async function requireCommitteeMember(): Promise<CommitteeAuthResult> {
     };
   }
 
-  if (!member || member.is_active === false) {
+  if (!member || member.is_active !== true) {
     return {
       ok: false,
       response: NextResponse.json(
