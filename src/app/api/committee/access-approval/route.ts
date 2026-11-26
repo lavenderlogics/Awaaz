@@ -106,18 +106,13 @@ export async function POST(request: Request) {
   }
 
   if (payload.action === "reject") {
-    const { error } = await admin
+    // Only delete unapproved pending applicants; never delete already-active officers
+    // if rejecting an admin-upgrade request.
+    await admin
       .from("committee_members")
       .delete()
       .eq("user_id", payload.applicantUserId)
-      .eq("is_active", false);
-
-    if (error) {
-      return NextResponse.json(
-        { error: error.message },
-        { status: 500, headers: NO_STORE }
-      );
-    }
+      .neq("is_active", true);
 
     await invalidateDashboardCache();
     return NextResponse.json(

@@ -205,6 +205,8 @@ export function CommitteeDashboardClient({
   );
   const [pendingNotice, setPendingNotice] = useState("");
   const [requestingAccess, setRequestingAccess] = useState(false);
+  const [requestingAdminUpgrade, setRequestingAdminUpgrade] = useState(false);
+  const [adminUpgradeMessage, setAdminUpgradeMessage] = useState("");
   const [currentMember, setCurrentMember] =
     useState<CurrentCommitteeMember | null>(null);
 
@@ -1051,7 +1053,7 @@ export function CommitteeDashboardClient({
         error?: string;
       };
       if (json.emailSent) {
-        setPendingNotice("Reminder email sent to active committee admin(s).");
+        setPendingNotice("Reminder email sent to the administrator email.");
       } else {
         setPendingNotice(
           json.message ??
@@ -1061,6 +1063,51 @@ export function CommitteeDashboardClient({
       }
     } finally {
       setRequestingAccess(false);
+    }
+  };
+
+  const handleRequestAdminUpgrade = async () => {
+    setRequestingAdminUpgrade(true);
+    setAdminUpgradeMessage("");
+    try {
+      const res = await fetch("/api/committee/access-request", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ requestAdminUpgrade: true }),
+      });
+      const json = (await res.json()) as {
+        status?: string;
+        emailSent?: boolean;
+        targetAdminEmail?: string;
+        message?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        setAdminUpgradeMessage(
+          json.error ?? "Unable to send admin verification request."
+        );
+        return;
+      }
+      if (json.status === "active") {
+        setAdminUpgradeMessage("Your account already has active admin access.");
+        return;
+      }
+      if (json.emailSent) {
+        setAdminUpgradeMessage(
+          `Admin authorization email sent to ${json.targetAdminEmail ?? "the administrator"}.`
+        );
+      } else {
+        setAdminUpgradeMessage(
+          json.message ??
+            "Admin authorization request queued for administrator review."
+        );
+      }
+    } catch {
+      setAdminUpgradeMessage(
+        "Network error while sending admin verification request."
+      );
+    } finally {
+      setRequestingAdminUpgrade(false);
     }
   };
 
@@ -1286,21 +1333,42 @@ export function CommitteeDashboardClient({
         </StatusNotice>
       ) : (
         <StatusNotice title="Connected as Committee Officer" variant="navy">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <span>
-              Signed in as <strong>{userEmail}</strong> (
-              {currentMember?.role ?? "Committee"}). Zero-knowledge browser key
-              mode active.
-            </span>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleSignOut}
-              disabled={isSigningOut}
-            >
-              <LogOut className="h-3.5 w-3.5" />
-              {isSigningOut ? "Signing Out..." : "Sign Out"}
-            </Button>
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <span>
+                Signed in as <strong>{userEmail}</strong> (
+                {currentMember?.role ?? "Committee"}). Zero-knowledge browser key
+                mode active.
+              </span>
+              <div className="flex flex-wrap items-center gap-2">
+                {currentMember && currentMember.role !== "admin" ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleRequestAdminUpgrade}
+                    disabled={requestingAdminUpgrade}
+                  >
+                    {requestingAdminUpgrade
+                      ? "Sending Request..."
+                      : "Request Admin Access"}
+                  </Button>
+                ) : null}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleSignOut}
+                  disabled={isSigningOut}
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                  {isSigningOut ? "Signing Out..." : "Sign Out"}
+                </Button>
+              </div>
+            </div>
+            {adminUpgradeMessage ? (
+              <p className="text-xs font-medium text-navy/90">
+                {adminUpgradeMessage}
+              </p>
+            ) : null}
           </div>
         </StatusNotice>
       )}

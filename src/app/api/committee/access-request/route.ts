@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 import { getRedisClient, invalidateDashboardCache } from "@/lib/redis/client";
-import { notifyAdminsOfPendingApplicant } from "@/lib/security/admin-notify";
+import {
+  DEFAULT_APPROVER_EMAIL,
+  notifyAdminsOfPendingApplicant,
+} from "@/lib/security/admin-notify";
 import { checkRateLimit, getRateLimitClientKey } from "@/lib/security/rate-limit";
 import { isUuid, readNonEmptyString } from "@/lib/security/validation";
 import { createAdminClient } from "@/lib/supabase/admin";
@@ -11,9 +14,10 @@ import {
 import { createClient } from "@/lib/supabase/server";
 
 /**
- * Registers a newly signed-up or verified user into `committee_members` as
- * `is_active: false` (pending admin confirmation) and emails active admins.
- * Never allows self-activation or client-chosen roles.
+ * Handles committee access & admin-upgrade requests:
+ * - New signups register into `committee_members` as `is_active: false` (`role: "member"`).
+ * - Existing non-admin officers can submit `{ requestAdminUpgrade: true }`.
+ * - Both trigger a single-use HMAC-signed verification email to `ADMIN_NOTIFICATION_EMAIL` (`agrawalvantika@gmail.com`).
  */
 export async function POST(request: Request) {
   const rate = await checkRateLimit(
@@ -64,8 +68,6 @@ export async function POST(request: Request) {
       applicantEmail.split("@")[0] ??
       "Committee Applicant";
   } else {
-    // Immediate post-signUp registration before email link confirmation:
-    // verify strictly against Supabase Auth user creation timestamp and email.
     const candidateId =
       typeof body.userId === "string" ? body.userId.trim() : "";
     const candidateEmail =
@@ -111,6 +113,11 @@ export async function POST(request: Request) {
       "Committee Applicant";
   }
 
+  const origin = new URL(request.url).origin;
+  const targetAdminEmail =
+    process.env.ADMIN_NOTIFICATION_EMAIL?.trim().toLowerCase() ||
+    DEFAULT_APPROVER_EMAIL;
+
   const { data: existing } = await admin
     .from("committee_members")
     .select("user_id, full_name, role, is_active")
@@ -119,6 +126,40 @@ export async function POST(request: Request) {
 
   if (existing) {
     if (existing.is_active === true) {
+      if (existing.role !== "admin" && body.requestAdminUpgrade === true) {
+        const redis = getRedisClient();
+        const upgradeKey = `awaaz:approval:upgrade-cooldown:${applicantUserId}`;
+        const inCooldown = redis ? await redis.get(upgradeKey) : null;
+        if (inCooldown) {
+          return NextResponse.json({
+            status: "upgrade_requested",
+            emailSent: false,
+            targetAdminEmail,
+            message: `Admin upgrade verification was already sent recently to ${targetAdminEmail}.`,
+          });
+        }
+
+        const notify = await notifyAdminsOfPendingApplicant(admin, {
+          origin,
+          applicantUserId,
+          applicantEmail,
+          applicantName: existing.full_name || applicantName,
+          requestType: "admin_upgrade",
+        });
+
+        if (redis && notify.emailSent) {
+          await redis.set(upgradeKey, "1", { ex: 300 });
+        }
+
+        return NextResponse.json({
+          status: "upgrade_requested",
+          emailSent: notify.emailSent,
+          emailConfigured: notify.emailConfigured,
+          targetAdminEmail: notify.targetAdminEmail,
+          reason: notify.reason,
+        });
+      }
+
       return NextResponse.json({
         status: "active",
         role: existing.role,
@@ -126,26 +167,31 @@ export async function POST(request: Request) {
       });
     }
 
-    // Already pending: allow throttled admin reminder email only if requested and not recently sent.
     let reminderSent = false;
-    let emailConfigured = Boolean(process.env.RESEND_API_KEY?.trim());
+    let emailConfigured = false;
+    let reason: string | undefined;
+
     if (body.resendNotification === true) {
       const redis = getRedisClient();
       const cooldownKey = `awaaz:approval:notify-cooldown:${applicantUserId}`;
       const alreadyNotified = redis ? await redis.get(cooldownKey) : null;
       if (!alreadyNotified) {
-        const origin = new URL(request.url).origin;
         const notify = await notifyAdminsOfPendingApplicant(admin, {
           origin,
           applicantUserId,
           applicantEmail,
           applicantName: existing.full_name || applicantName,
+          requestType: "new_signup",
         });
         reminderSent = notify.emailSent;
         emailConfigured = notify.emailConfigured;
-        if (redis) {
+        reason = notify.reason;
+        if (redis && notify.emailSent) {
           await redis.set(cooldownKey, "1", { ex: 300 });
         }
+      } else {
+        emailConfigured = true;
+        reason = `Verification email was already sent to ${targetAdminEmail} within the last 5 minutes.`;
       }
     }
 
@@ -153,12 +199,12 @@ export async function POST(request: Request) {
       status: "pending",
       emailSent: reminderSent,
       emailConfigured,
-      message:
-        "Your access request is pending confirmation by a committee administrator.",
+      targetAdminEmail,
+      reason,
+      message: `Your access request is awaiting confirmation by ${targetAdminEmail}.`,
     });
   }
 
-  // Optional zero-admin bootstrap ONLY when 0 active admins exist AND BOOTSTRAP_ADMIN_EMAIL matches verified email
   let initialRole: "member" | "admin" = "member";
   let initialActive = false;
   const bootstrapEmail = process.env.BOOTSTRAP_ADMIN_EMAIL?.trim().toLowerCase();
@@ -205,16 +251,16 @@ export async function POST(request: Request) {
     );
   }
 
-  const origin = new URL(request.url).origin;
   const notifyResult = await notifyAdminsOfPendingApplicant(admin, {
     origin,
     applicantUserId,
     applicantEmail,
     applicantName,
+    requestType: "new_signup",
   });
 
   const redis = getRedisClient();
-  if (redis) {
+  if (redis && notifyResult.emailSent) {
     await redis.set(`awaaz:approval:notify-cooldown:${applicantUserId}`, "1", {
       ex: 300,
     });
@@ -225,6 +271,7 @@ export async function POST(request: Request) {
       status: "pending",
       emailSent: notifyResult.emailSent,
       emailConfigured: notifyResult.emailConfigured,
+      targetAdminEmail: notifyResult.targetAdminEmail,
       notifiedAdminCount: notifyResult.notifiedAdminCount,
       reason: notifyResult.reason,
     },
