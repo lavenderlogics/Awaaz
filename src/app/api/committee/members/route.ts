@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { invalidateDashboardCache } from "@/lib/redis/client";
 import { requireCommitteeMember } from "@/lib/security/committee-auth";
+import { updateCommitteeMemberResilient } from "@/lib/security/committee-roles";
 import { checkRateLimit, getRateLimitClientKey } from "@/lib/security/rate-limit";
 import { isUuid } from "@/lib/security/validation";
 import { createAdminClient } from "@/lib/supabase/admin";
@@ -89,17 +90,22 @@ export async function PATCH(request: Request) {
   }
 
   const admin = createAdminClient();
-  const { error } = await admin
-    .from("committee_members")
-    .update(updates)
-    .eq("user_id", targetUserId);
+  const { appliedUpdates, error } = await updateCommitteeMemberResilient(admin, {
+    memberId: targetUserId,
+    updates,
+    allowRoleFallback: updates.is_active === true,
+  });
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 
   await invalidateDashboardCache();
-  return NextResponse.json({ ok: true, memberId: targetUserId, updates });
+  return NextResponse.json({
+    ok: true,
+    memberId: targetUserId,
+    updates: appliedUpdates,
+  });
 }
 
 /** Admin-only endpoint to reject/remove a pending (`is_active !== true`) access request. */

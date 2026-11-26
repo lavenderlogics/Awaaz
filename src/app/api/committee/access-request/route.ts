@@ -4,6 +4,7 @@ import {
   DEFAULT_APPROVER_EMAIL,
   notifyAdminsOfPendingApplicant,
 } from "@/lib/security/admin-notify";
+import { insertCommitteeMemberResilient } from "@/lib/security/committee-roles";
 import { checkRateLimit, getRateLimitClientKey } from "@/lib/security/rate-limit";
 import { isUuid, readNonEmptyString } from "@/lib/security/validation";
 import { createAdminClient } from "@/lib/supabase/admin";
@@ -224,12 +225,13 @@ export async function POST(request: Request) {
     }
   }
 
-  const { error: insertError } = await admin.from("committee_members").insert({
-    user_id: applicantUserId,
-    full_name: applicantName,
-    role: initialRole,
-    is_active: initialActive,
-  });
+  const { role: recordedRole, error: insertError } =
+    await insertCommitteeMemberResilient(admin, {
+      userId: applicantUserId,
+      fullName: applicantName,
+      preferredRole: initialRole,
+      isActive: initialActive,
+    });
 
   if (insertError) {
     return NextResponse.json(
@@ -244,7 +246,7 @@ export async function POST(request: Request) {
     return NextResponse.json(
       {
         status: "active",
-        role: initialRole,
+        role: recordedRole,
         emailSent: false,
       },
       { status: 201 }

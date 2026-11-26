@@ -4,6 +4,7 @@ import {
   consumeAdminApprovalToken,
   inspectAdminApprovalToken,
 } from "@/lib/security/approval-tokens";
+import { upsertApprovedCommitteeMemberResilient } from "@/lib/security/committee-roles";
 import { checkRateLimit, getRateLimitClientKey } from "@/lib/security/rate-limit";
 import { createAdminClient } from "@/lib/supabase/admin";
 
@@ -127,17 +128,12 @@ export async function POST(request: Request) {
   }
 
   const assignedRole = payload.action === "approve_admin" ? "admin" : "member";
-  const { error } = await admin
-    .from("committee_members")
-    .upsert(
-      {
-        user_id: payload.applicantUserId,
-        full_name: payload.applicantName,
-        role: assignedRole,
-        is_active: true,
-      },
-      { onConflict: "user_id" }
-    );
+  const { role: savedRole, error } =
+    await upsertApprovedCommitteeMemberResilient(admin, {
+      userId: payload.applicantUserId,
+      fullName: payload.applicantName,
+      preferredRole: assignedRole,
+    });
 
   if (error) {
     return NextResponse.json(
@@ -151,7 +147,7 @@ export async function POST(request: Request) {
     {
       ok: true,
       decision: assignedRole === "admin" ? "approved_admin" : "approved_member",
-      role: assignedRole,
+      role: savedRole,
       applicantName: payload.applicantName,
       applicantEmail: payload.applicantEmail,
     },
