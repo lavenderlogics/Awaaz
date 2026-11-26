@@ -126,23 +126,31 @@ export function ReportForm() {
 
     try {
       // 1. Fetch validated active committee public keys
-      const keysRes = await fetch("/api/committee/public-keys", {
-        cache: "no-store",
-      });
-      const keysJson = (await keysRes.json()) as {
-        members?: PublicCommitteeRecipient[];
-        error?: string;
-      };
+      let recipients: PublicCommitteeRecipient[];
+      try {
+        const keysRes = await fetch("/api/committee/public-keys", {
+          cache: "no-store",
+        });
+        const keysJson = (await keysRes.json()) as {
+          members?: PublicCommitteeRecipient[];
+          error?: string;
+        };
 
-      if (!keysRes.ok || !Array.isArray(keysJson.members)) {
+        if (!keysRes.ok || !Array.isArray(keysJson.members)) {
+          setServerError(
+            keysJson.error ??
+              "Unable to load committee encryption keys. Submission halted safely."
+          );
+          return;
+        }
+        recipients = keysJson.members;
+      } catch (err) {
         setServerError(
-          keysJson.error ??
-            "Unable to load committee encryption keys. Submission halted safely."
+          `Unable to fetch committee encryption keys (${err instanceof Error ? err.message : "network error"}). No complaint data was transmitted.`
         );
         return;
       }
 
-      const recipients = keysJson.members;
       if (recipients.length < 2) {
         setServerError(
           "At least 2 committee public keys are required for browser encryption. Submission halted safely."
@@ -150,91 +158,101 @@ export function ReportForm() {
         return;
       }
 
-      // 2. Generate complaint ID (used as AES-GCM AAD) and encrypt payload in browser
-      const complaintId = window.crypto.randomUUID();
-      const sensitivePayload = {
-        detailedCategory: form.category,
-        urgency: form.urgency,
-        incidentDate: form.incidentDate,
-        location: form.location.trim(),
-        description: form.description.trim(),
-        additionalContext: form.additionalContext.trim(),
-        evidenceFileNames: files.map((f) => f.name),
-      };
+      // 2 & 3. Encrypt payload and evidence strictly inside the browser
+      let complaintId: string;
+      let body: FormData;
+      try {
+        complaintId = window.crypto.randomUUID();
+        const sensitivePayload = {
+          detailedCategory: form.category,
+          urgency: form.urgency,
+          incidentDate: form.incidentDate,
+          location: form.location.trim(),
+          description: form.description.trim(),
+          additionalContext: form.additionalContext.trim(),
+          evidenceFileNames: files.map((f) => f.name),
+        };
 
-      const envelope = await encryptComplaintInBrowser({
-        complaintId,
-        payload: sensitivePayload,
-        recipients,
-      });
-
-      // 3. Encrypt every evidence file individually in browser with unique IV & DEK
-      const evidenceMeta: Array<{ fileId: string; mimeType: string }> = [];
-      const encryptedEvidenceFiles: Array<{ fileId: string; blob: Blob }> = [];
-
-      for (const file of files) {
-        const fileId = window.crypto.randomUUID();
-        const rawBytes = new Uint8Array(await file.arrayBuffer());
-        const encryptedResult = await encryptEvidenceBytesInBrowser({
-          fileBytes: rawBytes,
-          mimeType: file.type,
+        const envelope = await encryptComplaintInBrowser({
           complaintId,
-          fileId,
+          payload: sensitivePayload,
           recipients,
         });
-        rawBytes.fill(0);
 
-        evidenceMeta.push({
-          fileId: encryptedResult.fileId,
-          mimeType: encryptedResult.mimeType,
-        });
-        const copy = new Uint8Array(encryptedResult.encryptedBytes.byteLength);
-        copy.set(encryptedResult.encryptedBytes);
-        encryptedEvidenceFiles.push({
-          fileId: encryptedResult.fileId,
-          blob: new Blob([copy.buffer], { type: "application/octet-stream" }),
-        });
-      }
+        const evidenceMeta: Array<{ fileId: string; mimeType: string }> = [];
+        const encryptedEvidenceFiles: Array<{ fileId: string; blob: Blob }> = [];
 
-      // 4. Send ONLY ciphertext envelope and encrypted evidence blobs to server
-      const body = new FormData();
-      body.set("complaintId", complaintId);
-      body.set("category", form.category);
-      body.set("encryptedPayload", JSON.stringify(envelope));
-      body.set("evidenceMeta", JSON.stringify(evidenceMeta));
+        for (const file of files) {
+          const fileId = window.crypto.randomUUID();
+          const rawBytes = new Uint8Array(await file.arrayBuffer());
+          const encryptedResult = await encryptEvidenceBytesInBrowser({
+            fileBytes: rawBytes,
+            mimeType: file.type,
+            complaintId,
+            fileId,
+            recipients,
+          });
+          rawBytes.fill(0);
 
-      for (const item of encryptedEvidenceFiles) {
-        body.append("evidence", item.blob, `${item.fileId}.enc`);
-      }
+          evidenceMeta.push({
+            fileId: encryptedResult.fileId,
+            mimeType: encryptedResult.mimeType,
+          });
+          const copy = new Uint8Array(encryptedResult.encryptedBytes.byteLength);
+          copy.set(encryptedResult.encryptedBytes);
+          encryptedEvidenceFiles.push({
+            fileId: encryptedResult.fileId,
+            blob: new Blob([copy.buffer], { type: "application/octet-stream" }),
+          });
+        }
 
-      const res = await fetch("/api/complaints", {
-        method: "POST",
-        body,
-      });
-      const json = (await res.json()) as Record<string, unknown>;
+        body = new FormData();
+        body.set("complaintId", complaintId);
+        body.set("category", form.category);
+        body.set("encryptedPayload", JSON.stringify(envelope));
+        body.set("evidenceMeta", JSON.stringify(evidenceMeta));
 
-      if (!res.ok) {
+        for (const item of encryptedEvidenceFiles) {
+          body.append("evidence", item.blob, `${item.fileId}.enc`);
+        }
+      } catch (err) {
+        // Never fall back to unencrypted or server-side submission
         setServerError(
-          typeof json.error === "string"
-            ? json.error
-            : "Unable to submit encrypted report."
+          `Client-side encryption failed in your browser (${err instanceof Error ? err.message : "Web Crypto error"}). No complaint data was transmitted.`
         );
         return;
       }
 
-      setSuccessData({
-        complaintId: String(json.complaintId ?? complaintId),
-        caseCode: String(json.caseCode ?? ""),
-        recoverySecret: String(json.recoverySecret ?? ""),
-        evidenceCount: Number(json.evidenceCount ?? 0),
-      });
-      setForm(INITIAL_STATE);
-      setFiles([]);
-    } catch {
-      // Never fall back to unencrypted or server-side submission
-      setServerError(
-        "Client-side encryption failed in your browser. No complaint data was transmitted."
-      );
+      // 4. Send ONLY ciphertext envelope and encrypted evidence blobs to server
+      try {
+        const res = await fetch("/api/complaints", {
+          method: "POST",
+          body,
+        });
+        const json = (await res.json()) as Record<string, unknown>;
+
+        if (!res.ok) {
+          setServerError(
+            typeof json.error === "string"
+              ? json.error
+              : "Unable to submit encrypted report."
+          );
+          return;
+        }
+
+        setSuccessData({
+          complaintId: String(json.complaintId ?? complaintId),
+          caseCode: String(json.caseCode ?? ""),
+          recoverySecret: String(json.recoverySecret ?? ""),
+          evidenceCount: Number(json.evidenceCount ?? 0),
+        });
+        setForm(INITIAL_STATE);
+        setFiles([]);
+      } catch (err) {
+        setServerError(
+          `Encrypted report could not be delivered to the server (${err instanceof Error ? err.message : "network error"}). Please try again.`
+        );
+      }
     } finally {
       setIsSubmitting(false);
     }
