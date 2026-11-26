@@ -25,7 +25,7 @@ function escapeHtml(text: string): string {
     .replaceAll("'", "&#39;");
 }
 
-function isEmailTransportConfigured(): boolean {
+export function isEmailTransportConfigured(): boolean {
   const hasSmtp = Boolean(
     process.env.SMTP_USER?.trim() && process.env.SMTP_PASS?.trim()
   );
@@ -39,8 +39,12 @@ async function sendEmailViaConfiguredTransport(params: {
   html: string;
 }): Promise<{ ok: true; channel: "smtp" | "resend" } | { ok: false; error: string }> {
   const smtpUser = process.env.SMTP_USER?.trim();
-  const smtpPass = process.env.SMTP_PASS?.trim();
   const smtpHost = process.env.SMTP_HOST?.trim() || "smtp.gmail.com";
+  const rawSmtpPass = process.env.SMTP_PASS?.trim() ?? "";
+  const smtpPass =
+    smtpHost.toLowerCase() === "smtp.gmail.com"
+      ? rawSmtpPass.replace(/\s+/g, "")
+      : rawSmtpPass;
   const smtpPort = Number.parseInt(process.env.SMTP_PORT?.trim() || "465", 10);
 
   if (smtpUser && smtpPass) {

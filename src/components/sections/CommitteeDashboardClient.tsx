@@ -324,6 +324,7 @@ export function CommitteeDashboardClient({
             emailSent?: boolean;
             emailConfigured?: boolean;
             targetAdminEmail?: string;
+            reason?: string;
           };
           if (reqJson.status === "active") {
             [dashRes, auditRes] = await Promise.all([
@@ -336,9 +337,11 @@ export function CommitteeDashboardClient({
             setPendingNotice(
               reqJson.emailSent
                 ? `An authorization confirmation email has been sent to ${adminAddr}.`
-                : reqJson.emailConfigured
-                  ? `Your access request is queued for administrator approval (${adminAddr}).`
-                  : `Your access request is registered as pending for administrator approval (${adminAddr} / Dashboard Admin Approvals).`
+                : reqJson.reason
+                  ? `${reqJson.reason}`
+                  : reqJson.emailConfigured
+                    ? `Your access request is queued for administrator approval (${adminAddr}).`
+                    : `Your access request is registered as pending for administrator approval (${adminAddr} / Dashboard Admin Approvals).`
             );
           }
         } catch {
@@ -1051,15 +1054,17 @@ export function CommitteeDashboardClient({
       });
       const json = (await res.json()) as {
         emailSent?: boolean;
+        reason?: string;
         message?: string;
         error?: string;
       };
       if (json.emailSent) {
-        setPendingNotice("Reminder email sent to the administrator email.");
+        setPendingNotice("Reminder email sent to agrawalvantika@gmail.com.");
       } else {
         setPendingNotice(
-          json.message ??
+          json.reason ??
             json.error ??
+            json.message ??
             "Your request is queued for admin confirmation."
         );
       }

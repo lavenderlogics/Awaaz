@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getRedisClient, invalidateDashboardCache } from "@/lib/redis/client";
 import {
   DEFAULT_APPROVER_EMAIL,
+  isEmailTransportConfigured,
   notifyAdminsOfPendingApplicant,
 } from "@/lib/security/admin-notify";
 import { insertCommitteeMemberResilient } from "@/lib/security/committee-roles";
@@ -169,8 +170,10 @@ export async function POST(request: Request) {
     }
 
     let reminderSent = false;
-    let emailConfigured = false;
-    let reason: string | undefined;
+    let emailConfigured = isEmailTransportConfigured();
+    let reason: string | undefined = emailConfigured
+      ? undefined
+      : `Email transport is not configured on the server yet (add SMTP_USER/SMTP_PASS or RESEND_API_KEY so approval links send to ${targetAdminEmail}).`;
 
     if (body.resendNotification === true) {
       const redis = getRedisClient();
